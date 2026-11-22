@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robolab"
+version = "0.1.0"
+description = "Workbench for launching and monitoring robot algorithms"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2.10,<3"]
+
+[project.optional-dependencies]
+agent = ["fastapi>=0.115,<1", "uvicorn>=0.35,<1", "websockets>=15,<17"]
+client = ["flet>=1.0.5,<1.2", "httpx>=0.28,<1", "websockets>=15,<17"]
+desktop = ["flet[desktop]>=1.0.5,<1.2"]
+web = ["flet[web]>=1.0.5,<1.2"]
+dev = ["httpx>=0.28,<1", "pytest>=8,<10", "ruff>=0.11,<1"]
+
+[project.scripts]
+robolab-agent = "agent.main:run"
+robolab-client = "client.main:run"
+
+[tool.setuptools]
+packages = ["agent", "client", "common", "examples"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]
