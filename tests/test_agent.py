@@ -150,3 +150,67 @@ def test_reconnect_reports_gap_in_bounded_log(api, monkeypatch, tmp_path):
         assert snapshot["gap"] is True
         assert len(snapshot["logs"]) == LOG_LIMIT
         assert snapshot["logs"][0]["sequence"] == 6
+
+
+def test_catalog_describes_configuration_and_preserves_its_types(api):
+    script = api.get("/scripts").json()[0]
+    parameters = {parameter["key"]: parameter for parameter in script["parameters"]}
+    assert {item["kind"] for item in parameters.values()} == {
+        "bool",
+        "int",
+        "float",
+        "string",
+        "enum",
+    }
+    assert parameters["scan_points"]["requires"] == {"scenario": "scan"}
+    assert parameters["steps"]["minimum"] == 1
+    assert parameters["steps"]["maximum"] == 120
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"steps": True},
+        {"steps": "2"},
+        {"steps": 121},
+        {"interval": 0.01},
+        {"scenario": "other"},
+        {"scan_points": 4},
+        {"verbose": 1},
+        {"unknown": True},
+        {"label": " "},
+        {"label": "bad\nlabel"},
+    ],
+)
+def test_invalid_configuration_is_rejected_before_start(api, parameters):
+    assert (
+        api.post("/runs", json={"script_id": "mock-robot", "parameters": parameters}).status_code
+        == 422
+    )
+    with api.websocket_connect("/events") as events:
+        assert events.receive_json()["run"] is None
+
+
+def test_configuration_reaches_mock_process(api):
+    options = {
+        "steps": 2,
+        "interval": 0.1,
+        "scenario": "scan",
+        "scan_points": 4,
+        "label": "--tag for an experiment",
+        "verbose": True,
+    }
+    response = api.post("/runs", json={"script_id": "mock-robot", "parameters": options})
+    assert response.status_code == 201
+    lines = []
+    with api.websocket_connect("/events") as events:
+        for _ in range(15):
+            packet = events.receive_json()
+            lines.extend(packet["logs"])
+            if packet["run"]["exit_code"] is not None:
+                break
+        assert packet["run"]["exit_code"] == 0
+
+    assert any("--tag for an experiment" in line["message"] for line in lines)
+    assert any(line["level"] == "DEBUG" for line in lines)
+    assert len([line for line in lines if line["event"] == "mock_tick"]) == 2

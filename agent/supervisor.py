@@ -1,22 +1,45 @@
 import asyncio
 import json
 import os
+import signal
 import sys
 from collections import deque
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 from uuid import UUID, uuid4
 
-from common.protocol import LOG_LIMIT, EventFrame, LogLevel, LogLine, LogSource, RunState, RunStatus
+from agent.yahboom import Yahboom
+from common.protocol import (
+    LOG_LIMIT,
+    EventFrame,
+    LogLevel,
+    LogLine,
+    LogSource,
+    RunStarted,
+    RunState,
+    RunStatus,
+    SafetyState,
+)
 
 STOP_TIMEOUT = 3
+HEARTBEAT_TIMEOUT = 4.0
+EMERGENCY_TIMEOUT = 3.5
+PROCESS_POLL = 0.05
 LOG_LINE_LIMIT = 1000
 
 
 class RunConflict(Exception):
     pass
+
+
+@dataclass
+class Lease:
+    token: UUID
+    expires: float
+    deadline: float
 
 
 @dataclass
@@ -31,6 +54,9 @@ class Run:
     status: RunStatus = "running"
     logs: deque[LogLine] = field(default_factory=lambda: deque(maxlen=LOG_LIMIT))
     sequence: int = 0
+    device_fd: int | None = None
+    lease: Lease | None = None
+    watchdog: asyncio.Task[None] | None = None
 
     def state(self) -> RunState:
         return RunState(
@@ -49,7 +75,10 @@ class Run:
 
 
 class Supervisor:
-    def __init__(self) -> None:
+    def __init__(self, hardware: Yahboom | None = None) -> None:
+        self.hardware = hardware
+        self.safety = SafetyState() if hardware is not None else None
+        self.safety_generation = 0
         self.current: Run | None = None
         self.start_lock = asyncio.Lock()
         self.changed = asyncio.Event()
@@ -59,39 +88,176 @@ class Supervisor:
         changed, self.changed = self.changed, asyncio.Event()
         changed.set()
 
-    async def start(self, script_id: str, path: Path) -> RunState:
+    async def start(
+        self,
+        script_id: str,
+        path: Path,
+        arguments: list[str],
+        hardware_seconds: float | None = None,
+    ) -> RunStarted:
         async with self.start_lock:
-            if self.closing or (self.current is not None and self.current.finished is None):
-                raise RunConflict
+            if self.closing or self.active_run:
+                raise RunConflict("На агенте уже есть активный запуск.")
+
+            device = self.hardware if hardware_seconds is not None else None
+            if device is not None and self.safety is not None and self.safety.latched:
+                raise RunConflict("Запуск заблокирован. Проверьте робота и снимите блокировку.")
 
             run = Run(script_id)
+            device_options = {}
             environment = os.environ.copy()
             environment.pop("ROBOLAB_TOKEN", None)
+            environment["PYTHONIOENCODING"] = "utf-8"
+            executable = sys.executable
+            process = None
             try:
+                if device is not None:
+                    run.device_fd = device.acquire()
+                    await self.confirm_cutoff(run.device_fd)
+                    if self.safety is not None and self.safety.latched:
+                        raise RunConflict("Запуск прерван аварийной остановкой.")
+                    executable = str(device.settings.python)
+                    device_options = {"pass_fds": (run.device_fd,), "start_new_session": True}
                 process = await asyncio.create_subprocess_exec(
-                    sys.executable,
+                    executable,
                     "-u",
                     "-X",
                     "utf8",
                     str(path),
+                    *arguments,
                     cwd=path.parent,
                     env=environment,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    **device_options,
                 )
             except OSError:
                 run.finished = monotonic()
                 run.status = "failed"
                 self.current = run
-                self.append_log(run, "agent", "ERROR", "Не удалось создать процесс.")
+                self.append_log(
+                    run, "agent", "ERROR", "Не удалось подготовить или создать процесс."
+                )
                 raise
+            finally:
+                if run.device_fd is not None and process is None:
+                    os.close(run.device_fd)
+                    run.device_fd = None
 
             run.process = process
             self.current = run
+            if hardware_seconds is not None and run.device_fd is not None:
+                now = monotonic()
+                run.lease = Lease(uuid4(), now + HEARTBEAT_TIMEOUT, now + hardware_seconds)
+                self.update_cutoff(None)
+                run.watchdog = asyncio.create_task(self.watch_lease(run))
             run.task = asyncio.create_task(self.collect(run, process))
             self.notify()
-            return run.state()
+            return RunStarted(
+                **run.state().model_dump(), lease=run.lease.token if run.lease else None
+            )
+
+    @property
+    def active_run(self) -> Run | None:
+        run = self.current
+        return run if run is not None and run.finished is None else None
+
+    def inhibit(self, reason: str) -> None:
+        self.safety_generation += 1
+        self.safety = SafetyState(latched=True, reason=reason)
+        self.notify()
+
+    def update_cutoff(self, confirmed: bool | None) -> None:
+        assert self.safety is not None
+        self.safety = self.safety.model_copy(update={"motor_disable_confirmed": confirmed})
+        self.notify()
+
+    async def confirm_cutoff(self, lock_fd: int) -> None:
+        assert self.hardware is not None
+        try:
+            await self.hardware.motor_off(lock_fd)
+        except OSError:
+            self.inhibit("Не удалось подтвердить низкий уровень на входах ENA и ENB.")
+            self.update_cutoff(False)
+            raise
+        self.update_cutoff(True)
+
+    async def emergency_stop(self) -> SafetyState:
+        assert self.hardware is not None
+        self.inhibit("Запрошена аварийная остановка.")
+        async with self.start_lock:
+            run = self.active_run
+            if run is not None and run.device_fd is not None and run.task is not None:
+                self.stop(run.id, force=True)
+                try:
+                    await asyncio.wait_for(asyncio.shield(run.task), timeout=EMERGENCY_TIMEOUT)
+                except TimeoutError as exc:
+                    self.inhibit("Завершение процессов и проверка ENA/ENB ещё не подтверждены.")
+                    self.update_cutoff(False)
+                    raise OSError("Emergency cutoff timed out") from exc
+                assert self.safety is not None
+                if not self.safety.motor_disable_confirmed:
+                    raise OSError("Motor enable cutoff not confirmed")
+            else:
+                await self.cutoff_with_lock()
+            assert self.safety is not None
+            return self.safety
+
+    async def reset_safety(self) -> SafetyState:
+        async with self.start_lock:
+            run = self.active_run
+            if run is not None and run.device_fd is not None:
+                raise RunConflict("Дождитесь завершения запуска.")
+            generation = self.safety_generation
+            await self.cutoff_with_lock()
+            if generation != self.safety_generation:
+                raise RunConflict("Во время проверки запрошена аварийная остановка.")
+            self.safety = SafetyState(motor_disable_confirmed=True)
+            self.notify()
+            return self.safety
+
+    async def cutoff_with_lock(self) -> None:
+        assert self.hardware is not None
+        fd = self.hardware.acquire()
+        try:
+            await self.confirm_cutoff(fd)
+        finally:
+            os.close(fd)
+
+    def heartbeat(self, run_id: UUID, token: UUID) -> None:
+        run = self.active_run
+        now = monotonic()
+        if (
+            run is None
+            or run.id != run_id
+            or run.status != "running"
+            or run.lease is None
+            or run.lease.token != token
+            or now >= min(run.lease.expires, run.lease.deadline)
+        ):
+            raise RunConflict("Подтверждение управления больше не действует.")
+        run.lease.expires = now + HEARTBEAT_TIMEOUT
+
+    async def watch_lease(self, run: Run) -> None:
+        assert run.lease is not None and run.process is not None
+        lease = run.lease
+        while run.process.returncode is None:
+            cutoff = (
+                min(lease.deadline, lease.expires) if run.status == "running" else lease.deadline
+            )
+            remaining = cutoff - monotonic()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                continue
+            if run.status == "running" and lease.expires <= lease.deadline:
+                reason = "Потеряна связь с управляющим клиентом."
+                self.inhibit(reason)
+                self.append_log(run, "agent", "WARNING", reason)
+            else:
+                self.append_log(run, "agent", "INFO", "Истёк лимит времени запуска.")
+            self.stop(run.id, force=True)
+            return
 
     def append_log(
         self, run: Run, source: LogSource, level: LogLevel, message: str, event: str | None = None
@@ -124,65 +290,143 @@ class Supervisor:
             if source == "stdout" and message.startswith("{") and len(message) <= 4096:
                 try:
                     record = json.loads(message)
-                except ValueError:
+                except (ValueError, RecursionError):
                     record = None
                 if isinstance(record, dict) and isinstance(record.get("message"), str):
-                    message = record["message"]
+                    message = record["message"].encode("utf-8", "replace").decode("utf-8")
                     candidate = record.get("level")
                     if candidate in ("DEBUG", "INFO", "WARNING", "ERROR"):
                         level = candidate
                     if isinstance(record.get("event"), str):
-                        event = record["event"]
+                        event = record["event"].encode("utf-8", "replace").decode("utf-8")
             self.append_log(run, source, level, message, event)
 
     async def collect(self, run: Run, process: asyncio.subprocess.Process) -> None:
         assert process.stdout is not None and process.stderr is not None
-        code, *_ = await asyncio.gather(
-            process.wait(),
-            self.drain(run, process.stdout, "stdout"),
-            self.drain(run, process.stderr, "stderr"),
-        )
+        stdout = self.drain(run, process.stdout, "stdout")
+        stderr = self.drain(run, process.stderr, "stderr")
+        if run.device_fd is None:
+            await asyncio.gather(process.wait(), stdout, stderr)
+            safe = True
+        else:
+            safe = await self.finish_hardware(run, process, stdout, stderr)
+
         run.finished = monotonic()
-        if run.status == "stopping":
+        if not safe:
+            run.status = "failed"
+        elif run.status == "stopping":
             run.status = "stopped"
         else:
-            run.status = "succeeded" if code == 0 else "failed"
+            run.status = "succeeded" if process.returncode == 0 else "failed"
         self.notify()
 
-    def stop(self, run_id: UUID) -> RunState:
+    async def finish_hardware(
+        self,
+        run: Run,
+        process: asyncio.subprocess.Process,
+        stdout: Coroutine[None, None, None],
+        stderr: Coroutine[None, None, None],
+    ) -> bool:
+        assert run.device_fd is not None
+        readers = asyncio.gather(stdout, stderr)
+        safe = True
+        try:
+            try:
+                await self.wait_for_exit(process)
+                self.kill_group(process)
+                await asyncio.wait_for(readers, timeout=1)
+            except asyncio.CancelledError:
+                safe = False
+                self.kill_group(process)
+                try:
+                    await asyncio.wait_for(self.wait_for_exit(process), timeout=STOP_TIMEOUT)
+                except TimeoutError:
+                    pass
+            except Exception:
+                safe = False
+                reason = "Не удалось завершить сбор вывода группы процессов."
+                self.inhibit(reason)
+                self.append_log(run, "agent", "ERROR", reason)
+        finally:
+            if run.watchdog is not None:
+                run.watchdog.cancel()
+            if not readers.done():
+                readers.cancel()
+            try:
+                if process.returncode is None:
+                    safe = False
+                    self.inhibit("Процесс Yahboom ещё не завершён.")
+                    self.update_cutoff(False)
+                else:
+                    try:
+                        await self.confirm_cutoff(run.device_fd)
+                    except OSError:
+                        safe = False
+                        self.append_log(
+                            run, "agent", "ERROR", "Отключение моторов не подтверждено."
+                        )
+            finally:
+                os.close(run.device_fd)
+                run.device_fd = None
+        return safe
+
+    def stop(self, run_id: UUID, *, force: bool = False) -> RunState:
         run = self.current
         if run is None or run.id != run_id:
             raise KeyError(run_id)
-        if run.status == "running" and run.process is not None and run.process.returncode is None:
-            run.status = "stopping"
-            self.notify()
-            asyncio.create_task(self.terminate(run, run.process))
+        process = run.process
+        if process is not None and process.returncode is None:
+            if force and run.device_fd is not None:
+                run.status = "stopping"
+                self.kill_group(process)
+                self.notify()
+            elif run.status == "running":
+                run.status = "stopping"
+                self.notify()
+                asyncio.create_task(self.terminate(run, process))
         return run.state()
 
+    @staticmethod
+    async def wait_for_exit(process: asyncio.subprocess.Process) -> None:
+        while process.returncode is None:
+            await asyncio.sleep(PROCESS_POLL)
+
+    @staticmethod
+    def kill_group(process: asyncio.subprocess.Process) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
     async def terminate(self, run: Run, process: asyncio.subprocess.Process) -> None:
+        uses_hardware = run.device_fd is not None
         try:
             process.terminate()
-            await asyncio.wait_for(process.wait(), timeout=STOP_TIMEOUT)
+            wait = self.wait_for_exit(process) if uses_hardware else process.wait()
+            await asyncio.wait_for(wait, timeout=STOP_TIMEOUT)
         except ProcessLookupError:
             return
         except TimeoutError:
             self.append_log(run, "agent", "WARNING", "Процесс не ответил на сигнал остановки.")
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            await process.wait()
+            if uses_hardware:
+                self.kill_group(process)
+            else:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
 
     def frame(self, run_id: UUID | None, after: int) -> EventFrame:
         run = self.current
         if run is None:
-            return EventFrame(run=None, logs=[])
+            return EventFrame(run=None, logs=[], safety=self.safety)
         if run_id != run.id:
             after = 0
         return EventFrame(
             run=run.state(),
             logs=[line for line in run.logs if line.sequence > after],
             gap=bool(run.logs and run.logs[0].sequence > after + 1),
+            safety=self.safety,
         )
 
     async def close(self) -> None:
@@ -191,4 +435,17 @@ class Supervisor:
             run = self.current
             if run is not None and run.task is not None:
                 self.stop(run.id)
-                await run.task
+                try:
+                    await asyncio.shield(run.task)
+                except asyncio.CancelledError:
+                    if run.device_fd is not None:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(run.task), timeout=STOP_TIMEOUT + EMERGENCY_TIMEOUT
+                            )
+                        except TimeoutError:
+                            self.inhibit("Завершение Yahboom при остановке агента не подтверждено.")
+                            self.update_cutoff(False)
+                    else:
+                        run.task.cancel()
+                    raise

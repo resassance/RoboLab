@@ -1,0 +1,70 @@
+{
+  "id": "mock-robot",
+  "name": "Mock Robot",
+  "description": "Демонстрационный алгоритм. Пишет события и шаги симуляции без доступа к роботу.",
+  "entrypoint": "examples/mock_robot.py",
+  "parameters": [
+    {
+      "key": "scenario",
+      "flag": "--scenario",
+      "kind": "enum",
+      "title": "Сценарий",
+      "description": "Патрулирование (patrol) или сканирование (scan).",
+      "group": "Режим",
+      "default": "patrol",
+      "choices": ["patrol", "scan"]
+    },
+    {
+      "key": "scan_points",
+      "flag": "--scan-points",
+      "kind": "int",
+      "title": "Точки сканирования",
+      "description": "Число точек на шаге, от 1 до 8.",
+      "group": "Режим",
+      "default": 3,
+      "minimum": 1,
+      "maximum": 8,
+      "requires": {"scenario": "scan"}
+    },
+    {
+      "key": "steps",
+      "flag": "--steps",
+      "kind": "int",
+      "title": "Шаги",
+      "description": "Количество шагов, от 1 до 120.",
+      "group": "Выполнение",
+      "default": 80,
+      "minimum": 1,
+      "maximum": 120
+    },
+    {
+      "key": "interval",
+      "flag": "--interval",
+      "kind": "float",
+      "title": "Интервал, с",
+      "description": "Пауза между шагами, от 0,1 до 2 секунд.",
+      "group": "Выполнение",
+      "default": 0.5,
+      "minimum": 0.1,
+      "maximum": 2.0
+    },
+    {
+      "key": "label",
+      "flag": "--label",
+      "kind": "string",
+      "title": "Метка запуска",
+      "description": "Название эксперимента в журнале, до 80 символов.",
+      "group": "Журнал",
+      "default": "RoboLab"
+    },
+    {
+      "key": "verbose",
+      "flag": "--verbose",
+      "kind": "bool",
+      "title": "Диагностика DEBUG",
+      "description": "Добавить параметры запуска в журнал.",
+      "group": "Журнал",
+      "default": false
+    }
+  ]
+}

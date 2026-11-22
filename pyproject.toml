@@ -24,6 +24,9 @@ robolab-client = "client.main:run"
 [tool.setuptools]
 packages = ["agent", "client", "common", "examples"]
 
+[tool.setuptools.package-data]
+examples = ["mock_robot.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
