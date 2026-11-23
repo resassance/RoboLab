@@ -7,9 +7,19 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag to build and publish
+        type: string
+      desktop_run_id:
+        description: Run ID with Windows and Linux artifacts for the same tag (optional)
+        type: string
 
 permissions:
   contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
 
 jobs:
   test:
@@ -29,6 +39,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
       - uses: actions/setup-python@v7.1.0
         with:
           python-version: ${{ matrix.python }}
@@ -45,23 +56,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            platform: linux
-          - os: windows-2022
-            platform: windows
-          - os: ubuntu-24.04
-            platform: apk
+        include: >-
+          ${{ fromJSON(inputs.release_tag && inputs.desktop_run_id
+            && '[{"os":"ubuntu-24.04","platform":"apk"}]'
+            || '[{"os":"ubuntu-24.04","platform":"linux"},{"os":"windows-2022","platform":"windows"},{"os":"ubuntu-24.04","platform":"apk"}]') }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
       - uses: actions/setup-python@v7.1.0
         with:
           python-version: '3.12'
       - name: Verify release version
-        if: github.ref_type == 'tag'
-        run: python -c "import os, pathlib, tomllib; version = tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']; assert os.environ['GITHUB_REF_NAME'] == 'v' + version, 'Tag does not match project version'"
+        if: env.RELEASE_TAG != ''
+        run: python -c "import os, pathlib, tomllib; version = tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']; assert os.environ['RELEASE_TAG'] == 'v' + version, 'Tag does not match project version'"
       - run: python -m pip install ".[release]"
       - name: Install Linux build dependencies
         if: matrix.platform == 'linux'
@@ -79,6 +88,7 @@ jobs:
       - name: Build client
         env:
           BUILD_PLATFORM: ${{ matrix.platform }}
+          GRADLE_OPTS: ${{ matrix.platform == 'apk' && '-Dorg.gradle.workers.max=1' || '' }}
         shell: bash
         run: python scripts/build_client.py "$BUILD_PLATFORM" --build-number "$GITHUB_RUN_NUMBER"
       - name: Verify APK signature
@@ -96,13 +106,40 @@ jobs:
           compression-level: 0
 
   release:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: inputs.release_tag || (github.event_name == 'push' && github.ref_type == 'tag')
     needs: package
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
+      actions: read
     steps:
+      - uses: actions/checkout@v7.0.1
+        if: inputs.release_tag && inputs.desktop_run_id
+        with:
+          persist-credentials: false
+          ref: refs/tags/${{ inputs.release_tag }}
+      - name: Verify desktop build source
+        if: inputs.release_tag && inputs.desktop_run_id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DESKTOP_RUN_ID: ${{ inputs.desktop_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DESKTOP_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          desktop_source=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$DESKTOP_RUN_ID" \
+            --jq '[.head_sha, .event, .head_branch, .path] | @tsv')
+          expected_source=$(printf '%s\tpush\t%s\t.github/workflows/ci.yml' "$(git rev-parse HEAD)" "$RELEASE_TAG")
+          test "$desktop_source" = "$expected_source"
+      - uses: actions/download-artifact@v8.0.2
+        if: inputs.release_tag && inputs.desktop_run_id
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.desktop_run_id }}
+          pattern: 'client-{linux,windows}'
+          path: dist
+          merge-multiple: true
       - uses: actions/download-artifact@v8.0.2
         with:
           pattern: client-*
@@ -115,7 +152,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          version=${GITHUB_REF_NAME#v}
+          version=${RELEASE_TAG#v}
           assets=("RoboLab-$version-linux-x64.tar.gz" "RoboLab-$version-windows-x64.zip" "RoboLab-$version-android.apk")
           sha256sum "${assets[@]}" > SHA256SUMS.txt
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "${assets[@]}" SHA256SUMS.txt
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "${assets[@]}" SHA256SUMS.txt
