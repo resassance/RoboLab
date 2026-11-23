@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,7 +11,11 @@ MOCK_ROBOT = Path(__file__).resolve().parents[1] / "examples" / "mock_robot.py"
 
 def run_mock(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(MOCK_ROBOT), *args], capture_output=True, text=True, timeout=5
+        [sys.executable, str(MOCK_ROBOT), *args],
+        capture_output=True,
+        encoding="utf-8",
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+        timeout=5,
     )
 
 
