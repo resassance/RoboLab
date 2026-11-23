@@ -23,6 +23,7 @@ class Health(BaseModel):
     protocol: int
     robot: Literal["mock", "yahboom"]
     camera_available: bool = False
+    observability_available: bool = False
 
 
 class Script(BaseModel):
@@ -137,3 +138,45 @@ class CameraOptions(BaseModel):
 
 class CameraStarted(BaseModel):
     id: UUID
+
+
+class MetricSample(BaseModel):
+    name: str
+    value: float
+    timestamp: datetime
+
+
+class Experiment(BaseModel):
+    id: UUID
+    script_id: str
+    script_name: str
+    parameters: dict[str, Value] = Field(default_factory=dict)
+    started_at: datetime
+    finished_at: datetime | None = None
+    status: RunStatus | Literal["interrupted"]
+    elapsed_seconds: float
+    exit_code: int | None = None
+    metrics: dict[str, float] = Field(default_factory=dict)
+
+
+class ExperimentDetails(BaseModel):
+    run: Experiment
+    logs: list[LogLine] = Field(default_factory=list)
+    samples: list[MetricSample] = Field(default_factory=list)
+
+
+class SystemTelemetry(BaseModel):
+    timestamp: datetime
+    cpu_percent: float | None = None
+    ram_used_bytes: int | None = None
+    ram_total_bytes: int | None = None
+    temperature_c: float | None = None
+    network_rx_bytes: int | None = None
+    network_tx_bytes: int | None = None
+    network_operational: bool | None = None
+    interfaces: list[str] = Field(default_factory=list)
+    robot: Literal["mock", "yahboom"]
+    camera_available: bool = False
+    hardware_busy: bool = False
+    run_id: UUID | None = None
+    metrics: dict[str, float] = Field(default_factory=dict)

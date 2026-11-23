@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import signal
 import sys
@@ -11,13 +12,18 @@ from pathlib import Path
 from time import monotonic
 from uuid import UUID, uuid4
 
+from agent.experiments import ExperimentStore
 from agent.yahboom import Yahboom
+from common.parameters import Value
 from common.protocol import (
     LOG_LIMIT,
     EventFrame,
+    Experiment,
+    ExperimentDetails,
     LogLevel,
     LogLine,
     LogSource,
+    MetricSample,
     RunStarted,
     RunState,
     RunStatus,
@@ -29,6 +35,8 @@ HEARTBEAT_TIMEOUT = 4.0
 EMERGENCY_TIMEOUT = 3.5
 PROCESS_POLL = 0.05
 LOG_LINE_LIMIT = 1000
+MAX_METRIC_NAMES = 32
+MAX_METRIC_SAMPLES = 1000
 
 
 class RunConflict(Exception):
@@ -45,15 +53,20 @@ class Lease:
 @dataclass
 class Run:
     script_id: str
+    script_name: str
+    parameters: dict[str, Value]
     id: UUID = field(default_factory=uuid4)
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     started: float = field(default_factory=monotonic)
     process: asyncio.subprocess.Process | None = None
     task: asyncio.Task[None] | None = None
     finished: float | None = None
+    finished_at: datetime | None = None
     status: RunStatus = "running"
     logs: deque[LogLine] = field(default_factory=lambda: deque(maxlen=LOG_LIMIT))
     sequence: int = 0
+    metrics: dict[str, float] = field(default_factory=dict)
+    samples: deque[MetricSample] = field(default_factory=lambda: deque(maxlen=MAX_METRIC_SAMPLES))
     device_fd: int | None = None
     lease: Lease | None = None
     watchdog: asyncio.Task[None] | None = None
@@ -75,8 +88,11 @@ class Run:
 
 
 class Supervisor:
-    def __init__(self, hardware: Yahboom | None = None) -> None:
+    def __init__(
+        self, hardware: Yahboom | None = None, history: ExperimentStore | None = None
+    ) -> None:
         self.hardware = hardware
+        self.history = history
         self.safety = SafetyState() if hardware is not None else None
         self.safety_generation = 0
         self.current: Run | None = None
@@ -94,6 +110,9 @@ class Supervisor:
         path: Path,
         arguments: list[str],
         hardware_seconds: float | None = None,
+        *,
+        script_name: str | None = None,
+        parameters: dict[str, Value] | None = None,
     ) -> RunStarted:
         async with self.start_lock:
             if self.closing or self.active_run:
@@ -103,7 +122,7 @@ class Supervisor:
             if device is not None and self.safety is not None and self.safety.latched:
                 raise RunConflict("Запуск заблокирован. Проверьте робота и снимите блокировку.")
 
-            run = Run(script_id)
+            run = Run(script_id, script_name or script_id, parameters or {})
             device_options = {}
             environment = os.environ.copy()
             environment.pop("ROBOLAB_TOKEN", None)
@@ -134,11 +153,13 @@ class Supervisor:
                 )
             except OSError:
                 run.finished = monotonic()
+                run.finished_at = datetime.now(UTC)
                 run.status = "failed"
                 self.current = run
                 self.append_log(
                     run, "agent", "ERROR", "Не удалось подготовить или создать процесс."
                 )
+                self.record_run(run)
                 raise
             finally:
                 if run.device_fd is not None and process is None:
@@ -152,6 +173,7 @@ class Supervisor:
                 run.lease = Lease(uuid4(), now + HEARTBEAT_TIMEOUT, now + hardware_seconds)
                 self.update_cutoff(None)
                 run.watchdog = asyncio.create_task(self.watch_lease(run))
+            self.record_run(run)
             run.task = asyncio.create_task(self.collect(run, process))
             self.notify()
             return RunStarted(
@@ -292,6 +314,8 @@ class Supervisor:
                     record = json.loads(message)
                 except (ValueError, RecursionError):
                     record = None
+                if isinstance(record, dict):
+                    self.add_metrics(run, record.get("metrics"))
                 if isinstance(record, dict) and isinstance(record.get("message"), str):
                     message = record["message"].encode("utf-8", "replace").decode("utf-8")
                     candidate = record.get("level")
@@ -300,6 +324,51 @@ class Supervisor:
                     if isinstance(record.get("event"), str):
                         event = record["event"].encode("utf-8", "replace").decode("utf-8")
             self.append_log(run, source, level, message, event)
+
+    def record_run(self, run: Run) -> None:
+        if self.history is None:
+            return
+        state = run.state()
+        self.history.record(
+            ExperimentDetails(
+                run=Experiment(
+                    id=run.id,
+                    script_id=run.script_id,
+                    script_name=run.script_name,
+                    parameters=run.parameters,
+                    started_at=run.started_at,
+                    finished_at=run.finished_at,
+                    status=run.status,
+                    elapsed_seconds=state.elapsed_seconds,
+                    exit_code=state.exit_code,
+                    metrics=run.metrics.copy(),
+                ),
+                logs=list(run.logs),
+                samples=list(run.samples),
+            )
+        )
+
+    @staticmethod
+    def add_metrics(run: Run, metrics: object) -> None:
+        if not isinstance(metrics, dict):
+            return
+        now = datetime.now(UTC)
+        for name, value in metrics.items():
+            if (
+                not isinstance(name, str)
+                or not 1 <= len(name) <= 64
+                or not name.isprintable()
+                or type(value) not in (int, float)
+                or (name not in run.metrics and len(run.metrics) >= MAX_METRIC_NAMES)
+            ):
+                continue
+            try:
+                value = float(value)
+            except OverflowError:
+                continue
+            if math.isfinite(value):
+                run.metrics[name] = value
+                run.samples.append(MetricSample(name=name, value=value, timestamp=now))
 
     async def collect(self, run: Run, process: asyncio.subprocess.Process) -> None:
         assert process.stdout is not None and process.stderr is not None
@@ -312,12 +381,14 @@ class Supervisor:
             safe = await self.finish_hardware(run, process, stdout, stderr)
 
         run.finished = monotonic()
+        run.finished_at = datetime.now(UTC)
         if not safe:
             run.status = "failed"
         elif run.status == "stopping":
             run.status = "stopped"
         else:
             run.status = "succeeded" if process.returncode == 0 else "failed"
+        self.record_run(run)
         self.notify()
 
     async def finish_hardware(

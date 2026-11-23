@@ -37,11 +37,13 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def emit(event: str, message: str, level: str = "INFO") -> None:
-    print(
-        json.dumps({"event": event, "level": level, "message": message}, ensure_ascii=False),
-        flush=True,
-    )
+def emit(
+    event: str, message: str, level: str = "INFO", *, metrics: dict[str, float] | None = None
+) -> None:
+    data = {"event": event, "level": level, "message": message}
+    if metrics:
+        data["metrics"] = metrics
+    print(json.dumps(data, ensure_ascii=False), flush=True)
 
 
 def main() -> None:
@@ -64,7 +66,11 @@ def main() -> None:
         if stopping.wait(args.interval):
             emit("mock_stopped", "Симуляция остановлена.")
             return
-        emit("mock_tick", f"Шаг симуляции {step}.{scan_suffix}")
+        emit(
+            "mock_tick",
+            f"Шаг симуляции {step}.{scan_suffix}",
+            metrics={"step": step, "progress_percent": 100 * step / args.steps},
+        )
     emit("mock_complete", "Симуляция завершена.")
 
 

@@ -9,15 +9,9 @@ import flet as ft
 from client.camera import CameraDialog
 from client.configuration import ConfigurationStore, ParameterDialog
 from client.connection import RobotConnection, RobotError
+from client.experiments import RUN_STATUS, ExperimentsPanel, TelemetryPanel
 from common.protocol import LOG_LIMIT, EventFrame, RunState, SafetyState, Script
 
-STATUS = {
-    "running": "Выполняется",
-    "stopping": "Останавливается…",
-    "succeeded": "Завершён",
-    "stopped": "Остановлен",
-    "failed": "Завершён с ошибкой",
-}
 PANEL = "#151F2D"
 MUTED = "#A7B7CB"
 ACCENT = "#70E0CD"
@@ -48,12 +42,22 @@ class Dashboard:
         self.configurations = ConfigurationStore()
         self.camera: CameraDialog | None = None
         self.camera_picker = ft.FilePicker()
+        self.observability: TelemetryPanel | ExperimentsPanel | None = None
 
         self.address = ft.TextField(label="Адрес агента", value="http://127.0.0.1:8765")
         self.token = ft.TextField(label="Токен агента", password=True, can_reveal_password=True)
         self.connection_button = ft.OutlinedButton("Подключиться", on_click=self.toggle_connection)
         self.connection_status = ft.Text("Нет подключения", color=MUTED)
         self.camera_button = ft.OutlinedButton("Камера", visible=False, on_click=self.open_camera)
+        self.telemetry_button = ft.OutlinedButton(
+            "Телеметрия", visible=False, on_click=self.open_telemetry
+        )
+        self.experiments_button = ft.OutlinedButton(
+            "Эксперименты", visible=False, on_click=self.open_experiments
+        )
+        self.observability_content = ft.Column(horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+        self.observability_card = self.card(self.observability_content)
+        self.observability_card.visible = False
         self.selector = ft.Dropdown(label="Скрипт", disabled=True, on_select=self.select_script)
         self.description = ft.Text(color=MUTED)
         self.parameters_button = ft.OutlinedButton(
@@ -116,7 +120,15 @@ class Dashboard:
             ft.Text("Подключение", size=17, weight=ft.FontWeight.W_600),
             self.address,
             self.token,
-            ft.Row([self.connection_button, self.camera_button], wrap=True),
+            ft.Row(
+                [
+                    self.connection_button,
+                    self.camera_button,
+                    self.telemetry_button,
+                    self.experiments_button,
+                ],
+                wrap=True,
+            ),
         )
         run_panel = self.card(
             ft.Text("Запуск", size=17, weight=ft.FontWeight.W_600),
@@ -139,6 +151,7 @@ class Dashboard:
                         spacing=12,
                         run_spacing=12,
                     ),
+                    self.observability_card,
                     self.log_card,
                 ],
                 expand=True,
@@ -194,6 +207,7 @@ class Dashboard:
         self.connected = False
         self.safety = None
         self.connection_status.value = "Отключено"
+        observability_task = self.close_observability()
         self.close_camera()
         if task is not None:
             task.cancel()
@@ -201,6 +215,9 @@ class Dashboard:
         if task is not None:
             with suppress(asyncio.CancelledError):
                 await task
+        if observability_task is not None:
+            with suppress(asyncio.CancelledError):
+                await observability_task
 
     async def watch(self, robot: RobotConnection) -> None:
         delay = 1
@@ -210,6 +227,8 @@ class Dashboard:
                     scripts = await robot.catalog()
                     if not robot.camera_available:
                         self.close_camera()
+                    if not robot.observability_available:
+                        self.close_observability()
                     self.scripts = {script.id: script for script in scripts}
                     self.selector.options = [
                         ft.DropdownOption(key=s.id, text=s.name) for s in scripts
@@ -229,6 +248,7 @@ class Dashboard:
                             self.refresh()
                 except RobotError as exc:
                     self.connected = False
+                    self.close_observability()
                     self.close_camera()
                     if robot.kind == "yahboom":
                         self.drop_lease()
@@ -248,6 +268,7 @@ class Dashboard:
                 self.task = None
                 self.connected = False
                 self.safety = None
+                self.close_observability()
                 self.close_camera()
                 self.refresh()
 
@@ -301,6 +322,11 @@ class Dashboard:
             self.connected and self.robot is not None and self.robot.camera_available
         )
         self.camera_button.disabled = self.camera is not None
+        self.telemetry_button.visible = self.experiments_button.visible = bool(
+            self.connected and self.robot is not None and self.robot.observability_available
+        )
+        self.telemetry_button.disabled = isinstance(self.observability, TelemetryPanel)
+        self.experiments_button.disabled = isinstance(self.observability, ExperimentsPanel)
         self.selector.disabled = not self.connected or busy or self.pending
         selected = self.scripts.get(self.selector.value or "")
         self.description.value = selected.description if selected else ""
@@ -358,7 +384,7 @@ class Dashboard:
     def format_run(self, current: RunState | None) -> str:
         if current is None:
             return "Запусков пока нет."
-        fields = [STATUS[current.status], f"{current.elapsed_seconds:.1f} с"]
+        fields = [RUN_STATUS[current.status], f"{current.elapsed_seconds:.1f} с"]
         if current.pid is not None:
             fields.append(f"PID {current.pid}")
         if current.exit_code is not None:
@@ -536,7 +562,11 @@ class Dashboard:
     async def disconnect_page(self, event: ft.ControlEvent) -> None:
         self.page_available = False
         self.drop_lease()
+        task = self.close_observability()
         self.close_camera()
+        if task is not None:
+            with suppress(asyncio.CancelledError):
+                await task
 
     async def close(self, event: ft.ControlEvent) -> None:
         self.closed = True
@@ -569,6 +599,63 @@ class Dashboard:
         if self.camera is camera:
             self.camera = None
             self.refresh()
+
+    def observability_robot(self) -> RobotConnection | None:
+        robot = self.robot
+        if (
+            not self.closed
+            and self.page_available
+            and self.connected
+            and robot is not None
+            and robot.observability_available
+        ):
+            return robot
+        return None
+
+    async def open_telemetry(self, event: ft.ControlEvent) -> None:
+        robot = self.observability_robot()
+        if robot is not None and not self.telemetry_button.disabled:
+            self.show_observability("Телеметрия", TelemetryPanel(robot))
+
+    async def open_experiments(self, event: ft.ControlEvent) -> None:
+        robot = self.observability_robot()
+        if robot is not None and not self.experiments_button.disabled:
+            self.show_observability(
+                "Эксперименты", ExperimentsPanel(self.page, robot, self.camera_picker)
+            )
+
+    def show_observability(self, title: str, panel: TelemetryPanel | ExperimentsPanel) -> None:
+        self.close_observability()
+        self.observability = panel
+        self.observability_content.controls = [
+            ft.Row(
+                [
+                    ft.Text(title, size=17, weight=ft.FontWeight.W_600),
+                    ft.TextButton("Закрыть", on_click=self.dismiss_observability),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                wrap=True,
+            ),
+            panel.content,
+        ]
+        self.observability_card.visible = True
+        self.refresh()
+        panel.start()
+
+    def close_observability(self) -> asyncio.Task[None] | None:
+        panel, self.observability = self.observability, None
+        if panel is None:
+            return None
+        self.observability_card.visible = False
+        self.observability_content.controls.clear()
+        return panel.close()
+
+    async def dismiss_observability(self, event: ft.ControlEvent) -> None:
+        task = self.close_observability()
+        self.refresh()
+        if task is not None:
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 async def main(page: ft.Page) -> None:

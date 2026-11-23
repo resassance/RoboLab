@@ -16,14 +16,18 @@ from common.protocol import (
     CameraOptions,
     CameraStarted,
     EventFrame,
+    Experiment,
+    ExperimentDetails,
     Health,
     RunStarted,
     SafetyState,
     Script,
+    SystemTelemetry,
     valid_token,
 )
 
 CATALOG = TypeAdapter(list[Script])
+HISTORY = TypeAdapter(list[Experiment])
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +69,7 @@ class RobotConnection:
         self.headers = {"Authorization": f"Bearer {token}"}
         self.kind: Literal["mock", "yahboom"] | None = None
         self.camera_available = False
+        self.observability_available = False
 
     def http_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -110,6 +115,16 @@ class RobotConnection:
                     503: "Агент не подтвердил программное отключение двигателей.",
                 }.get(code, f"Ошибка команды безопасности HTTP {code}.")
                 raise RobotError(detail, retryable=code >= 500) from exc
+            if path == "/telemetry" or path == "/history" or path.startswith("/history/"):
+                detail = {
+                    404: (
+                        "Запуск отсутствует в истории."
+                        if path.startswith("/history/")
+                        else "Агент не поддерживает этот раздел."
+                    ),
+                    422: "Агент отклонил параметры запроса.",
+                }.get(code, f"Ошибка запроса HTTP {code}.")
+                raise RobotError(detail, retryable=code >= 500) from exc
             detail = {
                 404: "Агент не нашёл скрипт или запуск.",
                 409: "На агенте уже есть активный запуск.",
@@ -128,9 +143,38 @@ class RobotConnection:
                 raise RobotError("Версия протокола агента отличается.", retryable=False)
             self.kind = health.robot
             self.camera_available = health.camera_available
+            self.observability_available = health.observability_available
             return CATALOG.validate_json(await self.request("GET", "/scripts"))
         except ValidationError as exc:
             raise RobotError("Агент вернул неизвестный формат данных.", retryable=False) from exc
+
+    async def telemetry(self, http: httpx.AsyncClient) -> SystemTelemetry:
+        response = await self.send(http, "GET", "/telemetry")
+        try:
+            return SystemTelemetry.model_validate_json(response.content)
+        except ValidationError as exc:
+            raise RobotError(
+                "Агент вернул неизвестный формат телеметрии.", retryable=False
+            ) from exc
+
+    async def history(self, *, limit: int, offset: int) -> list[Experiment]:
+        data = await self.request("GET", "/history", params={"limit": limit, "offset": offset})
+        try:
+            return HISTORY.validate_json(data)
+        except ValidationError as exc:
+            raise RobotError("Агент вернул неизвестный формат истории.", retryable=False) from exc
+
+    async def experiment(self, run_id: UUID) -> ExperimentDetails:
+        data = await self.request("GET", f"/history/{run_id}")
+        try:
+            return ExperimentDetails.model_validate_json(data)
+        except ValidationError as exc:
+            raise RobotError(
+                "Агент вернул неизвестный формат эксперимента.", retryable=False
+            ) from exc
+
+    async def export_experiment(self, run_id: UUID, format: Literal["csv", "json"]) -> bytes:
+        return await self.request("GET", f"/history/{run_id}/export", params={"format": format})
 
     async def start_camera(self, options: CameraOptions) -> UUID:
         data = await self.request("POST", "/camera", json=options.model_dump(mode="json"))

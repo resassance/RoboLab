@@ -7,7 +7,7 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 import uvicorn
@@ -23,12 +23,16 @@ from fastapi import (
 )
 
 from agent.camera import CameraBusy, CameraMissing, CameraPreview, CameraSource, CameraUnavailable
+from agent.experiments import ExperimentStore, export_experiment
 from agent.supervisor import RunConflict, Supervisor
+from agent.telemetry import TelemetrySampler
 from agent.yahboom import DeviceBusy, Yahboom, load_yahboom
 from common.protocol import (
     PROTOCOL_VERSION,
     CameraOptions,
     CameraStarted,
+    Experiment,
+    ExperimentDetails,
     Health,
     Heartbeat,
     RunStarted,
@@ -36,6 +40,7 @@ from common.protocol import (
     SafetyState,
     Script,
     StartRequest,
+    SystemTelemetry,
     valid_token,
 )
 
@@ -46,12 +51,18 @@ logger = logging.getLogger(__name__)
 
 
 def create_app(
-    token: str, hardware: Yahboom | None = None, *, mock_camera: bool = False
+    token: str,
+    hardware: Yahboom | None = None,
+    *,
+    mock_camera: bool = False,
+    data_dir: Path | None = None,
 ) -> FastAPI:
     if not valid_token(token):
         raise ValueError("RoboLab requires a URL-safe token of 32 to 256 characters")
     expected_auth = f"Bearer {token}".encode("ascii")
-    supervisor = Supervisor(hardware)
+    history = ExperimentStore(data_dir / "history.sqlite3" if data_dir is not None else None)
+    sampler = TelemetrySampler()
+    supervisor = Supervisor(hardware, history)
     source = None
     if hardware is not None and hardware.settings.camera_device is not None:
         source = CameraSource(
@@ -64,12 +75,18 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
+            if data_dir is not None:
+                await asyncio.to_thread(data_dir.mkdir, parents=True, exist_ok=True)
+            await history.open()
             yield
         finally:
             try:
                 await camera.close()
             finally:
-                await supervisor.close()
+                try:
+                    await supervisor.close()
+                finally:
+                    await history.close()
 
     def authorized(value: str | None) -> bool:
         return hmac.compare_digest((value or "").encode(), expected_auth)
@@ -87,6 +104,7 @@ def create_app(
             protocol=PROTOCOL_VERSION,
             robot="yahboom" if hardware else "mock",
             camera_available=source is not None,
+            observability_available=True,
         )
 
     @app.get("/scripts", dependencies=auth)
@@ -109,15 +127,22 @@ def create_app(
         script, path = registration
         hardware_seconds = None
         try:
-            arguments = script.arguments(request.parameters)
+            configuration = script.configuration(request.parameters)
+            arguments = script.arguments(configuration)
             if device is not None:
-                configuration = script.configuration(request.parameters)
                 hardware_seconds = float(configuration["max_seconds"])
                 arguments = device.arguments(script_id, arguments)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         try:
-            return await supervisor.start(script_id, path, arguments, hardware_seconds)
+            return await supervisor.start(
+                script_id,
+                path,
+                arguments,
+                hardware_seconds,
+                script_name=script.name,
+                parameters=configuration,
+            )
         except RunConflict as exc:
             raise HTTPException(409, str(exc)) from exc
         except DeviceBusy as exc:
@@ -219,6 +244,64 @@ def create_app(
     async def reset_safety() -> SafetyState:
         return await safety_action(reset=True)
 
+    @app.get("/telemetry", dependencies=auth)
+    async def telemetry() -> SystemTelemetry:
+        stats = await sampler.sample()
+        run = supervisor.current
+        active = supervisor.active_run
+        preview = camera.current
+        busy = bool(
+            (active is not None and active.device_fd is not None)
+            or (
+                preview is not None
+                and preview.lock_fd is not None
+                and preview.task is not None
+                and not preview.task.done()
+            )
+        )
+        return SystemTelemetry(
+            timestamp=stats.timestamp,
+            cpu_percent=stats.cpu_percent,
+            ram_used_bytes=stats.ram_used_bytes,
+            ram_total_bytes=stats.ram_total_bytes,
+            temperature_c=stats.temperature_c,
+            network_rx_bytes=stats.network_rx_bytes,
+            network_tx_bytes=stats.network_tx_bytes,
+            network_operational=stats.network_operational,
+            interfaces=stats.interfaces,
+            robot="yahboom" if hardware is not None else "mock",
+            camera_available=source is not None,
+            hardware_busy=busy,
+            run_id=run.id if run else None,
+            metrics=run.metrics if run else {},
+        )
+
+    @app.get("/history", dependencies=auth)
+    async def experiments(
+        limit: Annotated[int, Query(ge=1, le=100)] = 25,
+        offset: Annotated[int, Query(ge=0, le=1000000)] = 0,
+    ) -> list[Experiment]:
+        return await history.list(limit, offset)
+
+    @app.get("/history/{run_id}", dependencies=auth)
+    async def experiment(run_id: UUID) -> ExperimentDetails:
+        details = await history.get(run_id)
+        if details is None:
+            raise HTTPException(404, "Запуск отсутствует в истории.")
+        return details
+
+    @app.get("/history/{run_id}/export", dependencies=auth)
+    async def download_experiment(
+        run_id: UUID, format: Literal["json", "csv"] = "json"
+    ) -> Response:
+        details = await experiment(run_id)
+        body, media_type = export_experiment(details, format)
+        return Response(
+            content=body,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="robolab-{run_id}.{format}"'},
+        )
+
     @app.websocket("/events")
     async def events(
         socket: WebSocket,
@@ -252,6 +335,7 @@ def run() -> None:
     parser = argparse.ArgumentParser(prog="robolab-agent")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--data-dir", type=Path, default=Path.home() / ".robolab" / "data")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--yahboom-config", type=Path)
     source.add_argument("--mock-camera", action="store_true")
@@ -264,7 +348,7 @@ def run() -> None:
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     uvicorn.run(
-        create_app(token, hardware, mock_camera=options.mock_camera),
+        create_app(token, hardware, mock_camera=options.mock_camera, data_dir=options.data_dir),
         host=options.host,
         port=options.port,
         workers=1,
