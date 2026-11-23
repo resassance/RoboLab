@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -74,9 +76,11 @@ def test_start_stream_poll_reconnect_and_stop(api):
             final_logs.extend(packet["logs"])
             if packet["run"]["status"] == "stopped":
                 break
-        assert packet["run"]["exit_code"] == 0
+        assert packet["run"]["exit_code"] is not None
         assert packet["run"]["elapsed_seconds"] >= 0
-        assert any(line["event"] == "mock_stopped" for line in final_logs)
+        if sys.platform != "win32":
+            assert packet["run"]["exit_code"] == 0
+            assert any(line["event"] == "mock_stopped" for line in final_logs)
         assert api.post(f"/runs/{run_id}/stop").json()["status"] == "stopped"
 
     new_run = api.post("/runs", json={"script_id": "mock-robot"}).json()

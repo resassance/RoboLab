@@ -1,0 +1,121 @@
+name: RoboLab CI and builds
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: '3.11'
+          - os: ubuntu-24.04
+            python: '3.12'
+          - os: windows-2022
+            python: '3.12'
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install ".[agent,client,camera,dev]"
+      - run: python -m pytest -q
+      - run: python -m ruff check .
+      - run: python -m ruff format --check .
+
+  package:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'tag')
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+          - os: windows-2022
+            platform: windows
+          - os: ubuntu-24.04
+            platform: apk
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Verify release version
+        if: github.ref_type == 'tag'
+        run: python -c "import os, pathlib, tomllib; version = tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']; assert os.environ['GITHUB_REF_NAME'] == 'v' + version, 'Tag does not match project version'"
+      - run: python -m pip install ".[release]"
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dependencies=$(python -m flet_cli.cli --version --json | jq -r '.linux_dependencies[]')
+          sudo apt-get update
+          xargs -r sudo apt-get install -y <<< "$dependencies"
+      - uses: actions/setup-java@v6.3.0
+        if: matrix.platform == 'apk'
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build client
+        env:
+          BUILD_PLATFORM: ${{ matrix.platform }}
+        shell: bash
+        run: python scripts/build_client.py "$BUILD_PLATFORM" --build-number "$GITHUB_RUN_NUMBER"
+      - name: Verify APK signature
+        if: matrix.platform == 'apk'
+        shell: bash
+        run: |
+          set -euo pipefail
+          signer=$(find "${ANDROID_HOME:?}/build-tools" -name apksigner -type f | sort -V | tail -n 1)
+          "$signer" verify dist/*.apk
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: client-${{ matrix.platform }}
+          path: dist/RoboLab-*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: client-*
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          version=${GITHUB_REF_NAME#v}
+          assets=("RoboLab-$version-linux-x64.tar.gz" "RoboLab-$version-windows-x64.zip" "RoboLab-$version-android.apk")
+          sha256sum "${assets[@]}" > SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "${assets[@]}" SHA256SUMS.txt
