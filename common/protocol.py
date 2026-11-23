@@ -24,6 +24,19 @@ class Health(BaseModel):
     robot: Literal["mock", "yahboom"]
     camera_available: bool = False
     observability_available: bool = False
+    files_available: bool = False
+
+
+class FileStorage(BaseModel):
+    roots: list[str]
+    max_upload_bytes: int = Field(gt=0)
+
+
+class FileReceipt(BaseModel):
+    root: str
+    path: list[str]
+    name: str
+    size: int = Field(ge=0)
 
 
 class Script(BaseModel):

@@ -1,10 +1,11 @@
 import argparse
 import asyncio
+import errno
 import hmac
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Literal
@@ -17,13 +18,23 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
+    Request,
     Response,
     WebSocket,
     WebSocketDisconnect,
 )
+from starlette.requests import ClientDisconnect
 
 from agent.camera import CameraBusy, CameraMissing, CameraPreview, CameraSource, CameraUnavailable
 from agent.experiments import ExperimentStore, export_experiment
+from agent.files import (
+    DEFAULT_UPLOAD_BYTES,
+    FileRoots,
+    FileUpload,
+    file_io,
+    parse_file_roots,
+    valid_name,
+)
 from agent.supervisor import RunConflict, Supervisor
 from agent.telemetry import TelemetrySampler
 from agent.yahboom import DeviceBusy, Yahboom, load_yahboom
@@ -33,6 +44,8 @@ from common.protocol import (
     CameraStarted,
     Experiment,
     ExperimentDetails,
+    FileReceipt,
+    FileStorage,
     Health,
     Heartbeat,
     RunStarted,
@@ -56,11 +69,14 @@ def create_app(
     *,
     mock_camera: bool = False,
     data_dir: Path | None = None,
+    file_roots: Mapping[str, Path] | None = None,
+    max_upload_bytes: int = DEFAULT_UPLOAD_BYTES,
 ) -> FastAPI:
     if not valid_token(token):
         raise ValueError("RoboLab requires a URL-safe token of 32 to 256 characters")
     expected_auth = f"Bearer {token}".encode("ascii")
     history = ExperimentStore(data_dir / "history.sqlite3" if data_dir is not None else None)
+    file_storage = FileRoots(file_roots, max_upload_bytes)
     sampler = TelemetrySampler()
     supervisor = Supervisor(hardware, history)
     source = None
@@ -105,7 +121,86 @@ def create_app(
             robot="yahboom" if hardware else "mock",
             camera_available=source is not None,
             observability_available=True,
+            files_available=bool(file_storage.roots),
         )
+
+    def upload_root(root: str, path: list[str]) -> Path:
+        location = file_storage.roots.get(root)
+        if location is None:
+            raise HTTPException(404, "Папка назначения недоступна.")
+        if any(not valid_name(part) for part in path):
+            raise HTTPException(400, "Недопустимый путь папки.")
+        return location
+
+    @app.get("/files", dependencies=auth)
+    async def files() -> FileStorage:
+        if not file_storage.roots:
+            raise HTTPException(404, "Хранилище файлов не настроено.")
+        return FileStorage(
+            roots=sorted(file_storage.roots), max_upload_bytes=file_storage.max_bytes
+        )
+
+    @app.get("/files/folders", dependencies=auth)
+    async def folders(root: str, path: Annotated[list[str] | None, Query()] = None) -> list[str]:
+        parts = path or []
+        location = upload_root(root, parts)
+        try:
+            return await file_io(file_storage.folders, location, parts)
+        except OSError as exc:
+            raise HTTPException(404, "Папка назначения недоступна.") from exc
+
+    @app.post("/files/upload", dependencies=auth, status_code=201)
+    async def upload(
+        request: Request, root: str, name: str, path: Annotated[list[str] | None, Query()] = None
+    ) -> FileReceipt:
+        parts = path or []
+        location = upload_root(root, parts)
+        if not valid_name(name):
+            raise HTTPException(400, "Недопустимое имя файла.")
+        if request.headers.get("content-type") != "application/octet-stream":
+            raise HTTPException(415, "Ожидаются двоичные данные файла.")
+        limit = file_storage.max_bytes
+        declared = request.headers.get("content-length")
+        try:
+            expected = int(declared) if declared is not None else None
+        except ValueError as exc:
+            raise HTTPException(400, "Недопустимый размер файла.") from exc
+        if expected is not None and expected < 0:
+            raise HTTPException(400, "Недопустимый размер файла.")
+        if expected is not None and expected > limit:
+            raise HTTPException(413, "Размер файла превышает лимит агента.")
+        transfer = FileUpload(location, parts, name)
+        size = 0
+        try:
+            await file_io(transfer.open)
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(413, "Размер файла превышает лимит агента.")
+                if expected is not None and size > expected:
+                    raise HTTPException(400, "Размер файла изменился во время передачи.")
+                if chunk:
+                    await file_io(transfer.write, chunk)
+            if expected is not None and size != expected:
+                raise HTTPException(400, "Файл передан не полностью.")
+            await file_io(transfer.publish)
+        except ClientDisconnect as exc:
+            raise HTTPException(400, "Передача прервана.") from exc
+        except FileExistsError as exc:
+            raise HTTPException(409, "Файл с таким именем уже существует.") from exc
+        except OSError as exc:
+            if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+                raise HTTPException(507, "На роботе недостаточно места.") from exc
+            if isinstance(exc, (FileNotFoundError, NotADirectoryError, PermissionError)):
+                raise HTTPException(404, "Папка назначения недоступна.") from exc
+            logger.exception("Could not write uploaded file")
+            raise HTTPException(503, "Агент не смог сохранить файл.") from exc
+        finally:
+            try:
+                await file_io(transfer.close)
+            except OSError:
+                logger.exception("Could not clear temporary upload")
+        return FileReceipt(root=root, path=parts, name=name, size=size)
 
     @app.get("/scripts", dependencies=auth)
     async def scripts() -> list[Script]:
@@ -336,6 +431,8 @@ def run() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-dir", type=Path, default=Path.home() / ".robolab" / "data")
+    parser.add_argument("--file-root", action="append", default=[], metavar="ИМЯ=/путь")
+    parser.add_argument("--max-upload-mib", type=int, default=DEFAULT_UPLOAD_BYTES // (1024**2))
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--yahboom-config", type=Path)
     source.add_argument("--mock-camera", action="store_true")
@@ -345,10 +442,18 @@ def run() -> None:
         parser.error("set ROBOLAB_TOKEN to a URL-safe token of 32 to 256 characters")
     try:
         hardware = load_yahboom(options.yahboom_config) if options.yahboom_config else None
+        app = create_app(
+            token,
+            hardware,
+            mock_camera=options.mock_camera,
+            data_dir=options.data_dir,
+            file_roots=parse_file_roots(options.file_root),
+            max_upload_bytes=options.max_upload_mib * 1024**2,
+        )
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     uvicorn.run(
-        create_app(token, hardware, mock_camera=options.mock_camera, data_dir=options.data_dir),
+        app,
         host=options.host,
         port=options.port,
         workers=1,

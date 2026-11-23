@@ -18,6 +18,8 @@ from common.protocol import (
     EventFrame,
     Experiment,
     ExperimentDetails,
+    FileReceipt,
+    FileStorage,
     Health,
     RunStarted,
     SafetyState,
@@ -28,6 +30,7 @@ from common.protocol import (
 
 CATALOG = TypeAdapter(list[Script])
 HISTORY = TypeAdapter(list[Experiment])
+FOLDERS = TypeAdapter(list[str])
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +73,7 @@ class RobotConnection:
         self.kind: Literal["mock", "yahboom"] | None = None
         self.camera_available = False
         self.observability_available = False
+        self.files_available = False
 
     def http_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -125,6 +129,20 @@ class RobotConnection:
                     422: "Агент отклонил параметры запроса.",
                 }.get(code, f"Ошибка запроса HTTP {code}.")
                 raise RobotError(detail, retryable=code >= 500) from exc
+            if path == "/files" or path.startswith("/files/"):
+                detail = {
+                    400: "Проверьте имя файла и папку назначения.",
+                    404: (
+                        "Хранилище файлов недоступно на агенте."
+                        if path == "/files"
+                        else "Папка назначения недоступна на агенте."
+                    ),
+                    409: "В этой папке уже есть файл с таким именем.",
+                    413: "Размер файла превышает лимит агента.",
+                    422: "Агент отклонил параметры передачи файла.",
+                    507: "На роботе недостаточно места для файла.",
+                }.get(code, f"Ошибка передачи файлов HTTP {code}.")
+                raise RobotError(detail, retryable=code >= 500 and code != 507) from exc
             detail = {
                 404: "Агент не нашёл скрипт или запуск.",
                 409: "На агенте уже есть активный запуск.",
@@ -144,6 +162,7 @@ class RobotConnection:
             self.kind = health.robot
             self.camera_available = health.camera_available
             self.observability_available = health.observability_available
+            self.files_available = health.files_available
             return CATALOG.validate_json(await self.request("GET", "/scripts"))
         except ValidationError as exc:
             raise RobotError("Агент вернул неизвестный формат данных.", retryable=False) from exc
@@ -175,6 +194,40 @@ class RobotConnection:
 
     async def export_experiment(self, run_id: UUID, format: Literal["csv", "json"]) -> bytes:
         return await self.request("GET", f"/history/{run_id}/export", params={"format": format})
+
+    async def file_storage(self) -> FileStorage:
+        data = await self.request("GET", "/files")
+        try:
+            return FileStorage.model_validate_json(data)
+        except ValidationError as exc:
+            raise RobotError("Агент вернул неизвестный формат хранилища.", retryable=False) from exc
+
+    async def file_folders(self, root: str, path: tuple[str, ...]) -> list[str]:
+        data = await self.request("GET", "/files/folders", params={"root": root, "path": path})
+        try:
+            return FOLDERS.validate_json(data)
+        except ValidationError as exc:
+            raise RobotError(
+                "Агент вернул неизвестный формат списка папок.", retryable=False
+            ) from exc
+
+    async def upload_file(
+        self, root: str, path: tuple[str, ...], name: str, source: AsyncIterator[bytes], size: int
+    ) -> FileReceipt:
+        data = await self.request(
+            "POST",
+            "/files/upload",
+            params={"root": root, "path": path, "name": name},
+            headers={"Content-Type": "application/octet-stream", "Content-Length": str(size)},
+            content=source,
+            timeout=httpx.Timeout(4.0, write=45.0, read=45.0),
+        )
+        try:
+            return FileReceipt.model_validate_json(data)
+        except ValidationError as exc:
+            raise RobotError(
+                "Агент вернул неизвестный формат ответа о передаче.", retryable=False
+            ) from exc
 
     async def start_camera(self, options: CameraOptions) -> UUID:
         data = await self.request("POST", "/camera", json=options.model_dump(mode="json"))

@@ -10,9 +10,13 @@ from client.camera import CameraDialog
 from client.configuration import ConfigurationStore, ParameterDialog
 from client.connection import RobotConnection, RobotError
 from client.experiments import RUN_STATUS, ExperimentsPanel, TelemetryPanel
+from client.files import FilePanel
 from common.protocol import LOG_LIMIT, EventFrame, RunState, SafetyState, Script
 
-PANEL = "#151F2D"
+PANEL = "#202733"
+BACKGROUND = "#171D28"
+RAIL = "#222936"
+ACTIVE = "#075F83"
 MUTED = "#A7B7CB"
 ACCENT = "#70E0CD"
 ERROR = "#FFB4A9"
@@ -43,6 +47,9 @@ class Dashboard:
         self.camera: CameraDialog | None = None
         self.camera_picker = ft.FilePicker()
         self.observability: TelemetryPanel | ExperimentsPanel | None = None
+        self.files: FilePanel | None = None
+        self.files_open = False
+        self.compact = False
 
         self.address = ft.TextField(label="Адрес агента", value="http://127.0.0.1:8765")
         self.token = ft.TextField(label="Токен агента", password=True, can_reveal_password=True)
@@ -55,6 +62,7 @@ class Dashboard:
         self.experiments_button = ft.OutlinedButton(
             "Эксперименты", visible=False, on_click=self.open_experiments
         )
+        self.files_button = ft.OutlinedButton("Файлы", visible=False, on_click=self.open_files)
         self.observability_content = ft.Column(horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
         self.observability_card = self.card(self.observability_content)
         self.observability_card.visible = False
@@ -68,7 +76,10 @@ class Dashboard:
         self.run_status = ft.Text("Запусков пока нет.", color=MUTED)
         self.emergency_button = ft.FilledButton(
             "Аварийная остановка",
-            style=ft.ButtonStyle(bgcolor="#B3261E", color=ft.Colors.WHITE),
+            height=44,
+            style=ft.ButtonStyle(
+                bgcolor="#B3261E", color=ft.Colors.WHITE, shape=ft.RoundedRectangleBorder(radius=8)
+            ),
             disabled=True,
             on_click=self.emergency_stop,
         )
@@ -78,7 +89,7 @@ class Dashboard:
         self.safety_status = ft.Text(color=MUTED)
         self.safety_controls = ft.Column(
             [
-                ft.Row([self.emergency_button, self.reset_button], wrap=True),
+                self.reset_button,
                 self.safety_status,
             ],
             visible=False,
@@ -98,37 +109,74 @@ class Dashboard:
     def mount(self) -> None:
         self.page.title = "RoboLab"
         self.page.theme_mode = ft.ThemeMode.DARK
-        self.page.theme = ft.Theme(color_scheme_seed=ACCENT)
-        self.page.bgcolor = "#0D1623"
-        self.page.padding = 18
+        self.page.theme = ft.Theme(color_scheme_seed="#24A5DD")
+        self.page.bgcolor = BACKGROUND
+        self.page.padding = 0
         self.page.on_connect = self.reconnect_page
         self.page.on_disconnect = self.disconnect_page
         self.page.on_close = self.close
         self.page.on_resize = self.resize
         self.page.services.append(self.camera_picker)
-        self.size_log()
 
-        heading = ft.Row(
-            [
-                ft.Text("RoboLab", size=26, weight=ft.FontWeight.BOLD),
-                self.connection_status,
-            ],
-            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        destinations = (
+            ("run", "Запуск", ft.Icons.PLAY_ARROW_OUTLINED, self.show_run),
+            ("camera", "Камера", ft.Icons.CAMERA_ALT_OUTLINED, self.open_camera),
+            ("telemetry", "Телеметрия", ft.Icons.QUERY_STATS, self.open_telemetry),
+            ("experiments", "Эксперименты", ft.Icons.SCIENCE_OUTLINED, self.open_experiments),
+            ("files", "Файлы", ft.Icons.FOLDER_OUTLINED, self.open_files),
+        )
+        self.nav = {
+            key: ft.TextButton(
+                label,
+                icon=icon,
+                on_click=on_click,
+                height=48,
+                style=self.nav_style(key == "run"),
+                visible=key == "run",
+            )
+            for key, label, icon, on_click in destinations
+        }
+        self.rail = ft.Container(
+            width=204,
+            bgcolor=RAIL,
+            padding=ft.Padding.symmetric(horizontal=10, vertical=16),
+            content=ft.Column(
+                [
+                    ft.Container(
+                        ft.Text("RoboLab", size=25, weight=ft.FontWeight.BOLD),
+                        padding=ft.Padding.only(left=10, bottom=10),
+                    ),
+                    *self.nav.values(),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                spacing=4,
+            ),
+        )
+        self.mobile_title = ft.Text("RoboLab", size=21, weight=ft.FontWeight.BOLD)
+        self.header = ft.Container(
+            bgcolor="#1C2431",
+            border=ft.Border.only(bottom=ft.BorderSide(1, "#364150")),
+            padding=ft.Padding.symmetric(horizontal=16, vertical=9),
+            content=ft.Row(
+                [
+                    ft.Column([self.mobile_title, self.connection_status], expand=True, spacing=2),
+                    self.emergency_button,
+                ],
+                spacing=8,
+            ),
+        )
+        self.mobile_tools = ft.Row(
+            [self.camera_button, self.telemetry_button, self.experiments_button, self.files_button],
             wrap=True,
+            spacing=8,
+            run_spacing=6,
         )
         connection_panel = self.card(
             ft.Text("Подключение", size=17, weight=ft.FontWeight.W_600),
             self.address,
             self.token,
-            ft.Row(
-                [
-                    self.connection_button,
-                    self.camera_button,
-                    self.telemetry_button,
-                    self.experiments_button,
-                ],
-                wrap=True,
-            ),
+            self.connection_button,
+            self.mobile_tools,
         )
         run_panel = self.card(
             ft.Text("Запуск", size=17, weight=ft.FontWeight.W_600),
@@ -137,12 +185,12 @@ class Dashboard:
             ft.Row([self.parameters_button, self.start_button, self.stop_button], wrap=True),
             self.run_status,
             self.safety_controls,
-            self.error,
         )
-        self.page.add(
-            ft.Column(
+        self.run_view = ft.Container(
+            expand=True,
+            padding=14,
+            content=ft.Column(
                 [
-                    heading,
                     ft.ResponsiveRow(
                         [
                             ft.Container(connection_panel, col={"xs": 12, "md": 6}),
@@ -154,10 +202,47 @@ class Dashboard:
                     self.observability_card,
                     self.log_card,
                 ],
-                expand=True,
-                spacing=12,
                 scroll=ft.ScrollMode.AUTO,
+                spacing=12,
+            ),
+        )
+        self.files_view = ft.Container(expand=True, visible=False)
+        self.files_safety = ft.Text(size=13, color=ERROR, visible=False)
+        self.layout()
+        self.page.add(
+            ft.SafeArea(
+                expand=True,
+                content=ft.Row(
+                    [
+                        self.rail,
+                        ft.Column(
+                            [
+                                self.header,
+                                self.error,
+                                self.files_safety,
+                                self.run_view,
+                                self.files_view,
+                            ],
+                            expand=True,
+                            spacing=0,
+                            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                        ),
+                    ],
+                    spacing=0,
+                    vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+                ),
             )
+        )
+        self.refresh()
+
+    @staticmethod
+    def nav_style(selected: bool) -> ft.ButtonStyle:
+        return ft.ButtonStyle(
+            alignment=ft.Alignment.CENTER_LEFT,
+            padding=ft.Padding.symmetric(horizontal=11),
+            color="#F1F5FA",
+            bgcolor=ACTIVE if selected else None,
+            shape=ft.RoundedRectangleBorder(radius=7),
         )
 
     @staticmethod
@@ -173,8 +258,16 @@ class Dashboard:
         stacked = (self.page.width or 0) < 804
         self.log_card.height = max(230, (self.page.height or 720) - (535 if stacked else 330))
 
-    async def resize(self, event: ft.ControlEvent) -> None:
+    def layout(self) -> None:
+        self.compact = (self.page.width or 0) < 850
+        self.rail.visible = not self.compact
+        self.mobile_title.visible = self.mobile_tools.visible = self.compact
+        if self.files is not None:
+            self.files.set_compact(self.compact)
         self.size_log()
+
+    async def resize(self, event: ft.ControlEvent) -> None:
+        self.layout()
         self.page.update()
 
     async def toggle_connection(self, event: ft.ControlEvent) -> None:
@@ -208,16 +301,15 @@ class Dashboard:
         self.safety = None
         self.connection_status.value = "Отключено"
         observability_task = self.close_observability()
+        files_task = self.close_files()
         self.close_camera()
         if task is not None:
             task.cancel()
         self.refresh()
-        if task is not None:
-            with suppress(asyncio.CancelledError):
-                await task
-        if observability_task is not None:
-            with suppress(asyncio.CancelledError):
-                await observability_task
+        for pending in (task, observability_task, files_task):
+            if pending is not None:
+                with suppress(asyncio.CancelledError):
+                    await pending
 
     async def watch(self, robot: RobotConnection) -> None:
         delay = 1
@@ -229,6 +321,8 @@ class Dashboard:
                         self.close_camera()
                     if not robot.observability_available:
                         self.close_observability()
+                    if not robot.files_available:
+                        self.close_files()
                     self.scripts = {script.id: script for script in scripts}
                     self.selector.options = [
                         ft.DropdownOption(key=s.id, text=s.name) for s in scripts
@@ -249,6 +343,7 @@ class Dashboard:
                 except RobotError as exc:
                     self.connected = False
                     self.close_observability()
+                    self.close_files()
                     self.close_camera()
                     if robot.kind == "yahboom":
                         self.drop_lease()
@@ -269,6 +364,7 @@ class Dashboard:
                 self.connected = False
                 self.safety = None
                 self.close_observability()
+                self.close_files()
                 self.close_camera()
                 self.refresh()
 
@@ -327,6 +423,12 @@ class Dashboard:
         )
         self.telemetry_button.disabled = isinstance(self.observability, TelemetryPanel)
         self.experiments_button.disabled = isinstance(self.observability, ExperimentsPanel)
+        self.files_button.visible = bool(
+            self.connected and self.robot is not None and self.robot.files_available
+        )
+        self.run_view.visible = not self.files_open
+        self.files_view.visible = self.files_open
+        self.refresh_navigation()
         self.selector.disabled = not self.connected or busy or self.pending
         selected = self.scripts.get(self.selector.value or "")
         self.description.value = selected.description if selected else ""
@@ -345,6 +447,7 @@ class Dashboard:
             not self.connected or self.pending or current is None or current.status != "running"
         )
         self.safety_controls.visible = hardware
+        self.emergency_button.visible = hardware
         self.emergency_button.disabled = not hardware or safety_pending
         self.reset_button.disabled = (
             not hardware
@@ -358,9 +461,31 @@ class Dashboard:
         )
         self.safety_status.value = self.format_safety(safety)
         self.safety_status.color = ERROR if safety and safety.latched else MUTED
+        self.files_safety.value = self.safety_status.value
+        self.files_safety.visible = bool(self.files_open and safety and safety.latched)
         self.empty_log.visible = not self.log.controls
         self.run_status.value = self.format_run(current)
         self.page.update()
+
+    def refresh_navigation(self) -> None:
+        for name, button in (
+            ("camera", self.camera_button),
+            ("telemetry", self.telemetry_button),
+            ("experiments", self.experiments_button),
+            ("files", self.files_button),
+        ):
+            self.nav[name].visible = button.visible
+        selected = "run"
+        if self.camera is not None:
+            selected = "camera"
+        elif self.files_open:
+            selected = "files"
+        elif isinstance(self.observability, TelemetryPanel):
+            selected = "telemetry"
+        elif isinstance(self.observability, ExperimentsPanel):
+            selected = "experiments"
+        for name, button in self.nav.items():
+            button.style = self.nav_style(name == selected)
 
     @staticmethod
     def format_safety(safety: SafetyState | None) -> str:
@@ -563,10 +688,12 @@ class Dashboard:
         self.page_available = False
         self.drop_lease()
         task = self.close_observability()
+        files_task = self.close_files()
         self.close_camera()
-        if task is not None:
-            with suppress(asyncio.CancelledError):
-                await task
+        for pending in (task, files_task):
+            if pending is not None:
+                with suppress(asyncio.CancelledError):
+                    await pending
 
     async def close(self, event: ft.ControlEvent) -> None:
         self.closed = True
@@ -626,6 +753,7 @@ class Dashboard:
 
     def show_observability(self, title: str, panel: TelemetryPanel | ExperimentsPanel) -> None:
         self.close_observability()
+        self.files_open = False
         self.observability = panel
         self.observability_content.controls = [
             ft.Row(
@@ -656,6 +784,42 @@ class Dashboard:
         if task is not None:
             with suppress(asyncio.CancelledError):
                 await task
+
+    async def show_run(self, event: ft.ControlEvent) -> None:
+        self.files_open = False
+        task = self.close_observability()
+        self.refresh()
+        if task is not None:
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def open_files(self, event: ft.ControlEvent) -> None:
+        robot = self.robot
+        if (
+            self.closed
+            or not self.page_available
+            or not self.connected
+            or robot is None
+            or not robot.files_available
+        ):
+            return
+        self.close_observability()
+        self.files_open = True
+        if self.files is None:
+            self.files = FilePanel(
+                self.page, robot, self.camera_picker, self.show_run, self.compact
+            )
+            self.files_view.content = self.files.content
+            self.refresh()
+            self.files.start()
+        else:
+            self.refresh()
+
+    def close_files(self) -> asyncio.Task[None] | None:
+        panel, self.files = self.files, None
+        self.files_open = False
+        self.files_view.content = None
+        return panel.close() if panel is not None else None
 
 
 async def main(page: ft.Page) -> None:
