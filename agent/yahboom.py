@@ -4,7 +4,7 @@ import stat
 import sys
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, StrictBool, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from common.parameters import Parameter
 from common.protocol import Script
@@ -26,6 +26,7 @@ class YahboomSettings(BaseModel):
     log_dir: Path
     lock_file: Path
     allow_motion: StrictBool = False
+    camera_device: str | None = Field(default=None, pattern=r"^/dev/video[0-9]+$")
 
     @field_validator("python", "script_dir", "config_file", "log_dir", "lock_file")
     @classmethod

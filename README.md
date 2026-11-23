@@ -65,6 +65,10 @@ py -3 -m venv .venv-client
 python -m examples.mock_robot --scenario scan --scan-points 4 --steps 3 --interval 0.2 --verbose
 ```
 
+## Просмотр камеры
+
+На ПК можно включить [тестовую камеру OpenCV](docs/CAMERA.md) и проверить четыре режима изображения без Raspberry Pi. Для Yahboom устройство задаётся локально. Кнопка **Камера** открывает настройки, а **Начать просмотр** запускает передачу кадров.
+
 ## Проверки разработки
 
 ```sh

@@ -22,6 +22,7 @@ def valid_token(token: str) -> bool:
 class Health(BaseModel):
     protocol: int
     robot: Literal["mock", "yahboom"]
+    camera_available: bool = False
 
 
 class Script(BaseModel):
@@ -121,3 +122,18 @@ class EventFrame(BaseModel):
     logs: list[LogLine]
     gap: bool = False
     safety: SafetyState | None = None
+
+
+CameraView = Literal["original", "gray", "mask", "overlay"]
+
+
+class CameraOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    view: CameraView = "original"
+    fps: int = Field(default=5, ge=1, le=8, strict=True)
+    quality: int = Field(default=75, ge=35, le=90, strict=True)
+
+
+class CameraStarted(BaseModel):
+    id: UUID

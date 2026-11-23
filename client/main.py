@@ -6,6 +6,7 @@ from uuid import UUID
 
 import flet as ft
 
+from client.camera import CameraDialog
 from client.configuration import ConfigurationStore, ParameterDialog
 from client.connection import RobotConnection, RobotError
 from common.protocol import LOG_LIMIT, EventFrame, RunState, SafetyState, Script
@@ -45,11 +46,14 @@ class Dashboard:
         self.page_available = True
         self.scripts: dict[str, Script] = {}
         self.configurations = ConfigurationStore()
+        self.camera: CameraDialog | None = None
+        self.camera_picker = ft.FilePicker()
 
         self.address = ft.TextField(label="Адрес агента", value="http://127.0.0.1:8765")
         self.token = ft.TextField(label="Токен агента", password=True, can_reveal_password=True)
         self.connection_button = ft.OutlinedButton("Подключиться", on_click=self.toggle_connection)
         self.connection_status = ft.Text("Нет подключения", color=MUTED)
+        self.camera_button = ft.OutlinedButton("Камера", visible=False, on_click=self.open_camera)
         self.selector = ft.Dropdown(label="Скрипт", disabled=True, on_select=self.select_script)
         self.description = ft.Text(color=MUTED)
         self.parameters_button = ft.OutlinedButton(
@@ -97,6 +101,7 @@ class Dashboard:
         self.page.on_disconnect = self.disconnect_page
         self.page.on_close = self.close
         self.page.on_resize = self.resize
+        self.page.services.append(self.camera_picker)
         self.size_log()
 
         heading = ft.Row(
@@ -111,7 +116,7 @@ class Dashboard:
             ft.Text("Подключение", size=17, weight=ft.FontWeight.W_600),
             self.address,
             self.token,
-            self.connection_button,
+            ft.Row([self.connection_button, self.camera_button], wrap=True),
         )
         run_panel = self.card(
             ft.Text("Запуск", size=17, weight=ft.FontWeight.W_600),
@@ -189,6 +194,7 @@ class Dashboard:
         self.connected = False
         self.safety = None
         self.connection_status.value = "Отключено"
+        self.close_camera()
         if task is not None:
             task.cancel()
         self.refresh()
@@ -202,6 +208,8 @@ class Dashboard:
             while True:
                 try:
                     scripts = await robot.catalog()
+                    if not robot.camera_available:
+                        self.close_camera()
                     self.scripts = {script.id: script for script in scripts}
                     self.selector.options = [
                         ft.DropdownOption(key=s.id, text=s.name) for s in scripts
@@ -221,6 +229,7 @@ class Dashboard:
                             self.refresh()
                 except RobotError as exc:
                     self.connected = False
+                    self.close_camera()
                     if robot.kind == "yahboom":
                         self.drop_lease()
                         self.safety = None
@@ -239,6 +248,7 @@ class Dashboard:
                 self.task = None
                 self.connected = False
                 self.safety = None
+                self.close_camera()
                 self.refresh()
 
     def show_frame(self, packet: EventFrame) -> None:
@@ -287,6 +297,10 @@ class Dashboard:
         self.token.disabled = watching
         self.connection_button.content = "Отключиться" if watching else "Подключиться"
         self.connection_status.color = ACCENT if self.connected else MUTED
+        self.camera_button.visible = bool(
+            self.connected and self.robot is not None and self.robot.camera_available
+        )
+        self.camera_button.disabled = self.camera is not None
         self.selector.disabled = not self.connected or busy or self.pending
         selected = self.scripts.get(self.selector.value or "")
         self.description.value = selected.description if selected else ""
@@ -522,10 +536,39 @@ class Dashboard:
     async def disconnect_page(self, event: ft.ControlEvent) -> None:
         self.page_available = False
         self.drop_lease()
+        self.close_camera()
 
     async def close(self, event: ft.ControlEvent) -> None:
         self.closed = True
+        camera_task = self.camera.task if self.camera is not None else None
         await self.disconnect()
+        if camera_task is not None:
+            with suppress(asyncio.CancelledError):
+                await camera_task
+
+    async def open_camera(self, event: ft.ControlEvent) -> None:
+        robot = self.robot
+        if (
+            self.closed
+            or not self.page_available
+            or not self.connected
+            or robot is None
+            or not robot.camera_available
+            or self.camera is not None
+        ):
+            return
+        self.camera = CameraDialog(self.page, robot, self.camera_picker, self.camera_closed)
+        self.camera.show()
+        self.refresh()
+
+    def close_camera(self) -> None:
+        if self.camera is not None:
+            self.camera.close(update=self.page_available and not self.closed)
+
+    def camera_closed(self, camera: CameraDialog) -> None:
+        if self.camera is camera:
+            self.camera = None
+            self.refresh()
 
 
 async def main(page: ft.Page) -> None:

@@ -1,5 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from math import isfinite
 from typing import Literal
 from uuid import UUID
 
@@ -11,6 +13,8 @@ from websockets.exceptions import InvalidStatus, WebSocketException
 from common.parameters import Value
 from common.protocol import (
     PROTOCOL_VERSION,
+    CameraOptions,
+    CameraStarted,
     EventFrame,
     Health,
     RunStarted,
@@ -20,6 +24,15 @@ from common.protocol import (
 )
 
 CATALOG = TypeAdapter(list[Script])
+
+
+@dataclass(frozen=True, slots=True)
+class CameraFrame:
+    jpeg: bytes
+    sequence: int
+    fps: float
+    age_ms: float
+    request_ms: float
 
 
 class RobotError(Exception):
@@ -51,20 +64,46 @@ class RobotConnection:
         self.url = url
         self.headers = {"Authorization": f"Bearer {token}"}
         self.kind: Literal["mock", "yahboom"] | None = None
+        self.camera_available = False
+
+    def http_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self.url, headers=self.headers, trust_env=False, timeout=4
+        )
 
     async def request(self, method: str, path: str, **kwargs: object) -> bytes:
+        async with self.http_client() as http:
+            return (await self.send(http, method, path, **kwargs)).content
+
+    async def send(
+        self, http: httpx.AsyncClient, method: str, path: str, **kwargs: object
+    ) -> httpx.Response:
         try:
-            async with httpx.AsyncClient(
-                base_url=self.url, headers=self.headers, trust_env=False, timeout=4
-            ) as http:
-                response = await http.request(method, path, **kwargs)
-                response.raise_for_status()
+            response = await http.request(method, path, **kwargs)
+            response.raise_for_status()
         except httpx.RequestError as exc:
             raise RobotError("Агент недоступен.") from exc
         except httpx.HTTPStatusError as exc:
             code = exc.response.status_code
             if code in (401, 403):
                 raise RobotError("Агент отклонил токен.", retryable=False) from exc
+            if path == "/camera" or path.startswith("/camera/"):
+                if code == 404 and method == "DELETE":
+                    return exc.response
+                detail = {
+                    404: (
+                        "Камера недоступна на агенте."
+                        if path == "/camera"
+                        else "Сессия камеры завершена. Запустите просмотр снова."
+                    ),
+                    409: "Камера или оборудование занято либо заблокировано.",
+                    422: "Агент отклонил параметры камеры.",
+                    503: {
+                        "POST": "Агент не смог запустить камеру.",
+                        "DELETE": "Агент не подтвердил завершение процесса камеры.",
+                    }.get(method, "Агент не смог получить кадр с камеры."),
+                }.get(code, f"Ошибка камеры HTTP {code}.")
+                raise RobotError(detail, retryable=False) from exc
             if path.startswith("/safety/"):
                 detail = {
                     409: "Команда безопасности пока недоступна. Проверьте состояние робота.",
@@ -80,7 +119,7 @@ class RobotConnection:
             if code == 409 and path == "/runs" and self.kind == "yahboom":
                 detail = "Запуск недоступен. Проверьте состояние робота и аварийной блокировки."
             raise RobotError(detail, retryable=code >= 500) from exc
-        return response.content
+        return response
 
     async def catalog(self) -> list[Script]:
         try:
@@ -88,9 +127,52 @@ class RobotConnection:
             if health.protocol != PROTOCOL_VERSION:
                 raise RobotError("Версия протокола агента отличается.", retryable=False)
             self.kind = health.robot
+            self.camera_available = health.camera_available
             return CATALOG.validate_json(await self.request("GET", "/scripts"))
         except ValidationError as exc:
             raise RobotError("Агент вернул неизвестный формат данных.", retryable=False) from exc
+
+    async def start_camera(self, options: CameraOptions) -> UUID:
+        data = await self.request("POST", "/camera", json=options.model_dump(mode="json"))
+        try:
+            return CameraStarted.model_validate_json(data).id
+        except ValidationError:
+            raise RobotError("Агент вернул неизвестный формат сессии камеры.") from None
+
+    async def camera_frame(
+        self, http: httpx.AsyncClient, session_id: UUID, after: int
+    ) -> CameraFrame | None:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        response = await self.send(
+            http, "GET", f"/camera/{session_id}/frame", params={"after": after}
+        )
+        request_ms = (loop.time() - started) * 1000
+        if response.status_code == 204:
+            return None
+        jpeg = response.content
+        try:
+            sequence = int(response.headers["X-Frame-Sequence"])
+            fps = float(response.headers["X-Frame-FPS"])
+            age_ms = float(response.headers["X-Frame-Age-Ms"])
+            if (
+                response.status_code == 200
+                and response.headers.get("Content-Type", "").partition(";")[0] == "image/jpeg"
+                and jpeg.startswith(b"\xff\xd8")
+                and jpeg.endswith(b"\xff\xd9")
+                and sequence > after
+                and isfinite(fps)
+                and isfinite(age_ms)
+                and fps >= 0
+                and age_ms >= 0
+            ):
+                return CameraFrame(jpeg, sequence, fps, age_ms, request_ms)
+        except (KeyError, ValueError):
+            pass
+        raise RobotError("Агент вернул некорректный кадр камеры.", retryable=False)
+
+    async def stop_camera(self, session_id: UUID) -> None:
+        await self.request("DELETE", f"/camera/{session_id}")
 
     async def start(
         self, script_id: str, parameters: dict[str, Value], *, requires_heartbeat: bool = False

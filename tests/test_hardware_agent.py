@@ -314,7 +314,8 @@ def test_reader_failure_does_not_skip_cutoff(api, hardware, monkeypatch):
     assert calls == ["motor_off", "motor_off"]
 
 
-def test_malformed_unicode_in_child_output_is_replayable(api, hardware):
+def test_malformed_unicode_in_child_output_is_replayable(api, hardware, monkeypatch):
+    monkeypatch.setattr(supervisor, "HEARTBEAT_TIMEOUT", 3.0)
     script = hardware[0].script_path
     script.write_text(
         'print(r\'{"message":"diagnostic \\ud800","event":"\\ud800"}\', flush=True)\n',
