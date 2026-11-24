@@ -17,10 +17,11 @@ if __name__ == "__main__":
 """
 
 
-def stage_client(root: Path, destination: Path) -> str:
+def stage_client(root: Path, destination: Path, *, platform: str = "linux") -> str:
     with (root / "pyproject.toml").open("rb") as stream:
         project = tomllib.load(stream)["project"]
     version = project["version"]
+    python_requirement = ">=3.14,<3.15" if platform == "apk" else ">=3.12,<3.13"
     dependencies = [
         dependency.replace("flet[cli]", "flet")
         for dependency in project["optional-dependencies"]["release"]
@@ -43,7 +44,7 @@ def stage_client(root: Path, destination: Path) -> str:
         f"""[project]
 name = "robolab"
 version = "{version}"
-requires-python = ">=3.12,<3.13"
+requires-python = "{python_requirement}"
 dependencies = {json.dumps(dependencies)}
 
 [tool.flet]
@@ -67,7 +68,7 @@ def build_client(platform: str, output: Path, build_number: int) -> Path:
         work = Path(temp)
         app = work / "app"
         bundle = work / "bundle"
-        version = stage_client(ROOT, app)
+        version = stage_client(ROOT, app, platform=platform)
         command = [
             sys.executable,
             "-m",

@@ -227,11 +227,13 @@ class Supervisor:
             return self.safety
 
     async def reset_safety(self) -> SafetyState:
+        generation = self.safety_generation
         async with self.start_lock:
+            if generation != self.safety_generation:
+                raise RunConflict("До проверки запрошена аварийная остановка.")
             run = self.active_run
             if run is not None and run.device_fd is not None:
                 raise RunConflict("Дождитесь завершения запуска.")
-            generation = self.safety_generation
             await self.cutoff_with_lock()
             if generation != self.safety_generation:
                 raise RunConflict("Во время проверки запрошена аварийная остановка.")

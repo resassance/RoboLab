@@ -2,10 +2,16 @@ import shutil
 import subprocess
 import tomllib
 
+import pytest
+
 from scripts.build_client import ROOT, stage_client
 
 
-def test_release_staging_includes_only_tracked_client_code(tmp_path):
+@pytest.mark.parametrize(
+    ("platform", "python_requirement"),
+    [("linux", ">=3.12,<3.13"), ("windows", ">=3.12,<3.13"), ("apk", ">=3.14,<3.15")],
+)
+def test_release_staging_includes_only_tracked_client_code(tmp_path, platform, python_requirement):
     repository = tmp_path / "checkout"
     repository.mkdir()
     shutil.copyfile(ROOT / "pyproject.toml", repository / "pyproject.toml")
@@ -25,7 +31,7 @@ def test_release_staging_includes_only_tracked_client_code(tmp_path):
     (repository / "client" / "untracked.py").write_text("TOKEN = 'private'\n", encoding="utf-8")
     destination = tmp_path / "package"
 
-    version = stage_client(repository, destination)
+    version = stage_client(repository, destination, platform=platform)
 
     assert {
         p.relative_to(destination).as_posix() for p in destination.rglob("*") if p.is_file()
@@ -39,9 +45,18 @@ def test_release_staging_includes_only_tracked_client_code(tmp_path):
     with (destination / "pyproject.toml").open("rb") as stream:
         project = tomllib.load(stream)
     assert project["project"]["version"] == version
+    assert project["project"]["requires-python"] == python_requirement
     dependencies = project["project"]["dependencies"]
     assert all(
         any(dependency.startswith(f"{name}==") for dependency in dependencies)
-        for name in ("flet", "httpx", "msgpack", "pydantic", "websockets")
+        for name in (
+            "asyncssh",
+            "flet",
+            "flet-secure-storage",
+            "httpx",
+            "msgpack",
+            "pydantic",
+            "websockets",
+        )
     )
     assert project["tool"]["flet"]["android"]["permission"] == {"android.permission.INTERNET": True}

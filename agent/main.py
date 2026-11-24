@@ -4,10 +4,12 @@ import errno
 import hmac
 import logging
 import os
+import stat
 import sys
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
+from time import monotonic
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -31,6 +33,7 @@ from agent.files import (
     DEFAULT_UPLOAD_BYTES,
     FileRoots,
     FileUpload,
+    directory,
     file_io,
     parse_file_roots,
     valid_name,
@@ -60,6 +63,8 @@ from common.protocol import (
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 MOCK = Script.model_validate_json((EXAMPLES / "mock_robot.json").read_bytes())
 REGISTRY = {MOCK.id: (MOCK, EXAMPLES / "mock_robot.py")}
+MAX_TOKEN_FILE_BYTES = 256 + len(b"\r\n")
+POWEROFF_HOLD_SECONDS = 30
 logger = logging.getLogger(__name__)
 
 
@@ -79,6 +84,7 @@ def create_app(
     file_storage = FileRoots(file_roots, max_upload_bytes)
     sampler = TelemetrySampler()
     supervisor = Supervisor(hardware, history)
+    poweroff_hold_until: float | None = None
     source = None
     if hardware is not None and hardware.settings.camera_device is not None:
         source = CameraSource(
@@ -311,6 +317,10 @@ def create_app(
             raise HTTPException(404, "Адаптер Yahboom не подключён.")
         try:
             if reset:
+                if poweroff_hold_until is not None and monotonic() < poweroff_hold_until:
+                    raise RunConflict(
+                        "Сброс блокировки недоступен во время подготовки к выключению."
+                    )
                 return await supervisor.reset_safety()
             if hardware.settings.camera_device is not None:
                 supervisor.inhibit("Запрошена аварийная остановка.")
@@ -333,6 +343,13 @@ def create_app(
 
     @app.post("/safety/stop", dependencies=auth)
     async def emergency_stop() -> SafetyState:
+        return await safety_action(reset=False)
+
+    @app.post("/safety/prepare-poweroff", dependencies=auth)
+    async def prepare_poweroff() -> SafetyState:
+        nonlocal poweroff_hold_until
+        if hardware is not None:
+            poweroff_hold_until = monotonic() + POWEROFF_HOLD_SECONDS
         return await safety_action(reset=False)
 
     @app.post("/safety/reset", dependencies=auth)
@@ -426,10 +443,48 @@ def create_app(
     return app
 
 
+def read_token_file(path: Path) -> str:
+    if sys.platform != "linux":
+        raise ValueError("--token-file is supported on Linux. Set ROBOLAB_TOKEN instead.")
+    try:
+        path = path.expanduser().absolute()
+        with directory(path.parts[1:-1]) as folder:
+            fd = os.open(
+                path.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=folder,
+            )
+            try:
+                info = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o077
+                ):
+                    raise ValueError(
+                        "--token-file requires a regular file owned by the agent user "
+                        "with no group or other permissions."
+                    )
+                raw = os.read(fd, MAX_TOKEN_FILE_BYTES + 1)
+            finally:
+                os.close(fd)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("cannot read --token-file. Use a path without symbolic links.") from exc
+
+    raw = raw[:-2] if raw.endswith(b"\r\n") else raw.removesuffix(b"\n")
+    token = raw.decode("ascii", errors="replace")
+    if not valid_token(token):
+        raise ValueError("--token-file must contain a URL-safe token of 32 to 256 characters")
+    return token
+
+
 def run() -> None:
     parser = argparse.ArgumentParser(prog="robolab-agent")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--token-file", type=Path, metavar="PATH", help="read a private token file on Linux"
+    )
     parser.add_argument("--data-dir", type=Path, default=Path.home() / ".robolab" / "data")
     parser.add_argument("--file-root", action="append", default=[], metavar="ИМЯ=/путь")
     parser.add_argument("--max-upload-mib", type=int, default=DEFAULT_UPLOAD_BYTES // (1024**2))
@@ -437,9 +492,15 @@ def run() -> None:
     source.add_argument("--yahboom-config", type=Path)
     source.add_argument("--mock-camera", action="store_true")
     options = parser.parse_args()
-    token = os.environ.get("ROBOLAB_TOKEN", "")
-    if not valid_token(token):
-        parser.error("set ROBOLAB_TOKEN to a URL-safe token of 32 to 256 characters")
+    if options.token_file is None:
+        token = os.environ.get("ROBOLAB_TOKEN", "")
+        if not valid_token(token):
+            parser.error("set ROBOLAB_TOKEN to a URL-safe token of 32 to 256 characters")
+    else:
+        try:
+            token = read_token_file(options.token_file)
+        except ValueError as exc:
+            parser.error(str(exc))
     try:
         hardware = load_yahboom(options.yahboom_config) if options.yahboom_config else None
         app = create_app(

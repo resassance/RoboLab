@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from agent import supervisor
+from agent import main, supervisor
 from agent.main import create_app
 from agent.yahboom import Yahboom, YahboomSettings
 
@@ -129,6 +129,83 @@ def test_explicit_emergency_stop_holds_latch_until_reset(api, hardware):
         assert frame["run"]["status"] == "stopped"
     assert api.post("/safety/reset").status_code == 200
     assert hardware[1] == ["motor_off", "motor_off", "motor_off"]
+
+
+def test_prepare_poweroff_holds_reset_until_latest_request_expires(api, monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(main, "monotonic", lambda: now)
+    prepare = "/safety/prepare-poweroff"
+
+    assert api.post(prepare, headers={"Authorization": ""}).status_code == 401
+    assert api.post("/safety/reset").status_code == 200
+    result = api.post(prepare)
+    assert result.status_code == 200
+    assert result.json()["latched"] is True
+    assert result.json()["motor_disable_confirmed"] is True
+    assert api.post("/safety/reset").status_code == 409
+    assert api.post("/runs", json=START).status_code == 409
+
+    now = 120.0
+    assert api.post(prepare).status_code == 200
+    now = 130.0
+    assert api.post("/safety/reset").status_code == 409
+    now = 149.9
+    assert api.post("/safety/reset").status_code == 409
+    now = 150.0
+    assert api.post("/runs", json=START).status_code == 409
+    assert api.post("/safety/reset").json()["latched"] is False
+
+
+def test_prepare_poweroff_holds_reset_before_cutoff_and_after_disconnect(hardware, monkeypatch):
+    import asyncio
+
+    import httpx
+
+    async def exercise():
+        cutoff_started = asyncio.Event()
+
+        async def suspend_cutoff(self, lock_fd):
+            cutoff_started.set()
+            await asyncio.Future()
+
+        monkeypatch.setattr(Yahboom, "motor_off", suspend_cutoff)
+        transport = httpx.ASGITransport(app=create_app(TOKEN, hardware[0]))
+        async with (
+            httpx.AsyncClient(
+                transport=transport, base_url="http://robot", headers=HEADERS
+            ) as user,
+            httpx.AsyncClient(
+                transport=transport, base_url="http://robot", headers=HEADERS
+            ) as other,
+        ):
+            preparing = asyncio.create_task(user.post("/safety/prepare-poweroff"))
+            try:
+                await asyncio.wait_for(cutoff_started.wait(), timeout=2)
+                reset = await asyncio.wait_for(other.post("/safety/reset"), timeout=2)
+                assert reset.status_code == 409
+            finally:
+                preparing.cancel()
+                await asyncio.gather(preparing, return_exceptions=True)
+            reset = await asyncio.wait_for(other.post("/safety/reset"), timeout=2)
+            assert reset.status_code == 409
+
+    asyncio.run(exercise())
+
+
+def test_reset_queued_before_new_safety_latch_is_rejected(hardware):
+    import asyncio
+
+    async def exercise():
+        controller = supervisor.Supervisor(hardware[0])
+        async with controller.start_lock:
+            reset = asyncio.create_task(controller.reset_safety())
+            await asyncio.sleep(0)
+            controller.inhibit("Запрошена аварийная остановка.")
+        with pytest.raises(supervisor.RunConflict):
+            await reset
+        assert controller.safety.latched
+
+    asyncio.run(exercise())
 
 
 def test_external_lock_prevents_start_and_cutoff(api, hardware):

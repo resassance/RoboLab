@@ -114,6 +114,8 @@ class RobotConnection:
                 }.get(code, f"Ошибка камеры HTTP {code}.")
                 raise RobotError(detail, retryable=False) from exc
             if path.startswith("/safety/"):
+                if code == 404 and path == "/safety/prepare-poweroff":
+                    raise RobotError("Обновите агент на Pi для безопасного выключения.") from exc
                 detail = {
                     409: "Команда безопасности пока недоступна. Проверьте состояние робота.",
                     503: "Агент не подтвердил программное отключение двигателей.",
@@ -300,7 +302,12 @@ class RobotConnection:
     async def safety_reset(self) -> SafetyState:
         return await self.safety_request("reset")
 
-    async def safety_request(self, action: Literal["stop", "reset"]) -> SafetyState:
+    async def prepare_poweroff(self) -> SafetyState:
+        return await self.safety_request("prepare-poweroff")
+
+    async def safety_request(
+        self, action: Literal["stop", "reset", "prepare-poweroff"]
+    ) -> SafetyState:
         data = await self.request("POST", f"/safety/{action}")
         try:
             return SafetyState.model_validate_json(data)

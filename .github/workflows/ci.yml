@@ -79,7 +79,7 @@ jobs:
           set -euo pipefail
           dependencies=$(python -m flet_cli.cli --version --json | jq -r '.linux_dependencies[]')
           sudo apt-get update
-          xargs -r sudo apt-get install -y <<< "$dependencies"
+          xargs -r sudo apt-get install -y libsecret-1-dev <<< "$dependencies"
       - uses: actions/setup-java@v6.3.0
         if: matrix.platform == 'apk'
         with:

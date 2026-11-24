@@ -11,6 +11,8 @@ from client.configuration import ConfigurationStore, ParameterDialog
 from client.connection import RobotConnection, RobotError
 from client.experiments import RUN_STATUS, ExperimentsPanel, TelemetryPanel
 from client.files import FilePanel
+from client.ssh import PoweroffUnconfirmed, SshError, SshSession, SshTarget
+from client.ssh_login import SshLogin, confirm, safe_poweroff
 from common.protocol import LOG_LIMIT, EventFrame, RunState, SafetyState, Script
 
 PANEL = "#202733"
@@ -30,6 +32,12 @@ class Dashboard:
         self.task: asyncio.Task[None] | None = None
         self.heartbeat_task: asyncio.Task[None] | None = None
         self.robot: RobotConnection | None = None
+        self.ssh_session: SshSession | None = None
+        self.ssh_target: SshTarget | None = None
+        self.ssh_task: asyncio.Task[None] | None = None
+        self.poweroff_pending = False
+        self.poweroff_dialog = False
+        self.disconnecting = False
         self.current: RunState | None = None
         self.safety: SafetyState | None = None
         self.safety_pending: RobotConnection | None = None
@@ -53,7 +61,25 @@ class Dashboard:
 
         self.address = ft.TextField(label="Адрес агента", value="http://127.0.0.1:8765")
         self.token = ft.TextField(label="Токен агента", password=True, can_reveal_password=True)
+        self.ssh_login = None if page.web else SshLogin(page)
+        self.connection_mode = ft.Dropdown(
+            label="Способ подключения",
+            value="ssh" if self.ssh_login else "agent",
+            options=[
+                ft.DropdownOption(key="ssh", text="SSH к Raspberry Pi"),
+                ft.DropdownOption(key="agent", text="Напрямую к агенту"),
+            ],
+            visible=self.ssh_login is not None,
+            on_select=self.select_connection,
+        )
         self.connection_button = ft.OutlinedButton("Подключиться", on_click=self.toggle_connection)
+        self.exit_button = ft.IconButton(ft.Icons.LOGOUT, tooltip="Выйти", on_click=self.exit)
+        self.poweroff_button = ft.OutlinedButton(
+            "Выключить Raspberry Pi",
+            icon=ft.Icons.POWER_SETTINGS_NEW,
+            on_click=self.request_poweroff,
+            visible=False,
+        )
         self.connection_status = ft.Text("Нет подключения", color=MUTED)
         self.camera_button = ft.OutlinedButton("Камера", visible=False, on_click=self.open_camera)
         self.telemetry_button = ft.OutlinedButton(
@@ -161,6 +187,7 @@ class Dashboard:
                 [
                     ft.Column([self.mobile_title, self.connection_status], expand=True, spacing=2),
                     self.emergency_button,
+                    self.exit_button,
                 ],
                 spacing=8,
             ),
@@ -173,9 +200,12 @@ class Dashboard:
         )
         connection_panel = self.card(
             ft.Text("Подключение", size=17, weight=ft.FontWeight.W_600),
+            self.connection_mode,
+            *([self.ssh_login.control] if self.ssh_login is not None else []),
             self.address,
             self.token,
             self.connection_button,
+            self.poweroff_button,
             self.mobile_tools,
         )
         run_panel = self.card(
@@ -234,6 +264,8 @@ class Dashboard:
             )
         )
         self.refresh()
+        if self.ssh_login is not None:
+            self.page.run_task(self.restore_login)
 
     @staticmethod
     def nav_style(selected: bool) -> ft.ButtonStyle:
@@ -270,19 +302,65 @@ class Dashboard:
         self.layout()
         self.page.update()
 
-    async def toggle_connection(self, event: ft.ControlEvent) -> None:
-        if self.closed or not self.page_available:
-            return
-        if self.task is not None:
+    async def restore_login(self) -> None:
+        login = self.ssh_login
+        if login is not None:
+            await login.restore()
+            self.refresh()
+
+    async def select_connection(self, event: ft.ControlEvent) -> None:
+        self.set_error("")
+        self.refresh()
+
+    async def exit(self, event: ft.ControlEvent) -> None:
+        if not self.poweroff_pending:
             await self.disconnect()
+
+    async def toggle_connection(self, event: ft.ControlEvent) -> None:
+        if self.closed or not self.page_available or self.connection_button.disabled:
+            return
+        if self.task is not None or self.ssh_task is not None:
             return
         self.set_error("")
+        if self.ssh_login is not None and self.connection_mode.value == "ssh":
+            self.ssh_login.message("")
+            self.ssh_task = asyncio.create_task(self.connect_ssh(self.ssh_login))
+            self.connection_status.value = "Подключение по SSH…"
+            self.refresh()
+            return
         try:
-            self.robot = RobotConnection(self.address.value or "", (self.token.value or "").strip())
+            robot = RobotConnection(self.address.value or "", (self.token.value or "").strip())
         except ValueError as exc:
             self.set_error(str(exc))
             self.refresh()
             return
+        self.connect_agent(robot)
+
+    async def connect_ssh(self, login: SshLogin) -> None:
+        session = None
+        try:
+            target, session = await login.connect()
+            if self.closed or not self.page_available:
+                return
+            robot = RobotConnection(session.address, session.token)
+            self.ssh_target, self.ssh_session = target, session
+            session = None
+            self.connect_agent(robot)
+        except (SshError, ValueError) as exc:
+            self.connection_status.value = "Нет подключения"
+            self.set_error(str(exc))
+        except (RuntimeError, TimeoutError):
+            self.connection_status.value = "Нет подключения"
+            self.set_error("Не удалось прочитать или сохранить параметры SSH.")
+        finally:
+            if self.ssh_task is asyncio.current_task():
+                self.ssh_task = None
+            if session is not None:
+                await session.close()
+            self.refresh()
+
+    def connect_agent(self, robot: RobotConnection) -> None:
+        self.robot = robot
         self.scripts = {}
         self.selector.options = []
         self.selector.value = None
@@ -290,26 +368,42 @@ class Dashboard:
         self.log.controls.clear()
         self.log_gap.visible = False
         self.connection_status.value = "Подключение…"
-        self.task = asyncio.create_task(self.watch(self.robot))
+        self.task = asyncio.create_task(self.watch(robot))
         self.refresh()
 
     async def disconnect(self) -> None:
+        self.disconnecting = True
         task, self.task = self.task, None
+        ssh_task, self.ssh_task = self.ssh_task, None
+        session, self.ssh_session, self.ssh_target = self.ssh_session, None, None
         self.drop_lease()
         self.robot = None
         self.connected = False
         self.safety = None
+        self.token.value = ""
+        if self.ssh_login is not None:
+            self.ssh_login.password.value = ""
+        self.set_error("")
         self.connection_status.value = "Отключено"
         observability_task = self.close_observability()
         files_task = self.close_files()
         self.close_camera()
-        if task is not None:
-            task.cancel()
-        self.refresh()
-        for pending in (task, observability_task, files_task):
+        for pending in (task, ssh_task):
             if pending is not None:
-                with suppress(asyncio.CancelledError):
-                    await pending
+                pending.cancel()
+        self.refresh()
+        try:
+            for pending in (task, ssh_task, observability_task, files_task):
+                if pending is not None:
+                    with suppress(asyncio.CancelledError):
+                        await pending
+        finally:
+            try:
+                if session is not None:
+                    await session.close()
+            finally:
+                self.disconnecting = False
+                self.refresh()
 
     async def watch(self, robot: RobotConnection) -> None:
         delay = 1
@@ -348,6 +442,10 @@ class Dashboard:
                     if robot.kind == "yahboom":
                         self.drop_lease()
                         self.safety = None
+                    if self.ssh_session is not None and self.ssh_session.closed:
+                        self.connection_status.value = "SSH-соединение закрыто"
+                        self.set_error("Подключитесь заново.")
+                        return
                     if not exc.retryable:
                         self.connection_status.value = "Нет подключения"
                         self.set_error(str(exc))
@@ -366,6 +464,9 @@ class Dashboard:
                 self.close_observability()
                 self.close_files()
                 self.close_camera()
+                session, self.ssh_session, self.ssh_target = self.ssh_session, None, None
+                if session is not None:
+                    await session.close()
                 self.refresh()
 
     def show_frame(self, packet: EventFrame) -> None:
@@ -404,15 +505,33 @@ class Dashboard:
     def refresh(self) -> None:
         if self.closed or not self.page_available:
             return
-        watching = self.task is not None
+        watching = self.task is not None or self.ssh_task is not None
         current = self.current
+        via_ssh = self.ssh_login is not None and self.connection_mode.value == "ssh"
         busy = current is not None and current.status in ("running", "stopping")
         hardware = self.robot is not None and self.robot.kind == "yahboom"
         safety_pending = hardware and self.safety_pending is self.robot
         safety = self.safety
-        self.address.disabled = watching
-        self.token.disabled = watching
-        self.connection_button.content = "Отключиться" if watching else "Подключиться"
+        self.address.visible = self.token.visible = not via_ssh
+        self.address.disabled = self.token.disabled = watching or self.disconnecting
+        self.connection_mode.disabled = watching or self.disconnecting
+        if self.ssh_login is not None:
+            self.ssh_login.control.visible = via_ssh
+            self.ssh_login.refresh(watching or self.disconnecting)
+        self.connection_button.visible = not watching
+        self.connection_button.disabled = (
+            self.disconnecting
+            or self.poweroff_pending
+            or bool(
+                via_ssh and self.ssh_login and (self.ssh_login.loading or self.ssh_login.forgetting)
+            )
+        )
+        self.exit_button.visible = watching
+        self.exit_button.disabled = self.poweroff_pending
+        self.poweroff_button.visible = bool(hardware and self.connected and self.ssh_session)
+        self.poweroff_button.disabled = bool(
+            self.poweroff_pending or self.poweroff_dialog or self.safety_pending or self.pending
+        )
         self.connection_status.color = ACCENT if self.connected else MUTED
         self.camera_button.visible = bool(
             self.connected and self.robot is not None and self.robot.camera_available
@@ -429,7 +548,7 @@ class Dashboard:
         self.run_view.visible = not self.files_open
         self.files_view.visible = self.files_open
         self.refresh_navigation()
-        self.selector.disabled = not self.connected or busy or self.pending
+        self.selector.disabled = not self.connected or busy or self.pending or self.poweroff_dialog
         selected = self.scripts.get(self.selector.value or "")
         self.description.value = selected.description if selected else ""
         self.start_button.disabled = (
@@ -453,6 +572,7 @@ class Dashboard:
             not hardware
             or not self.connected
             or safety_pending
+            or self.poweroff_dialog
             or busy
             or self.pending
             or self.heartbeat_task is not None
@@ -524,7 +644,9 @@ class Dashboard:
         self.refresh()
 
     def configuration_key(self, robot: RobotConnection, script: Script) -> str:
-        return f"robolab.configuration.v1.{robot.url}.{script.id}"
+        target = self.ssh_target
+        origin = f"ssh://{target.username}@{target.host}:{target.port}" if target else robot.url
+        return f"robolab.configuration.v1.{origin}.{script.id}"
 
     async def configure(self, event: ft.ControlEvent) -> None:
         robot = self.robot
@@ -641,6 +763,68 @@ class Dashboard:
             self.drop_lease()
             await self.safety_command(robot, robot.safety_stop)
 
+    async def request_poweroff(self, event: ft.ControlEvent) -> None:
+        robot, session, target = self.robot, self.ssh_session, self.ssh_target
+        if robot is None or session is None or target is None or self.poweroff_button.disabled:
+            return
+        if not self.poweroff_button.visible:
+            return
+        if self.files is not None and self.files.sending:
+            self.set_error("Завершите или отмените передачу файла перед выключением.")
+            self.refresh()
+            return
+
+        def active() -> bool:
+            return (
+                self.robot is robot
+                and self.ssh_session is session
+                and self.page_available
+                and not self.closed
+            )
+
+        password = ft.TextField(label="Пароль sudo, если требуется", password=True)
+        self.poweroff_dialog = True
+        self.refresh()
+        try:
+            accepted = await confirm(
+                self.page,
+                "Выключить Raspberry Pi?",
+                ft.Column(
+                    [
+                        ft.Text(f"{target.username}@{target.host}"),
+                        ft.Text("RoboLab остановит запуск и проверит отключение приводов."),
+                        password,
+                    ],
+                    tight=True,
+                ),
+                "Выключить",
+            )
+            if not accepted or not active():
+                return
+            if self.pending or self.safety_pending is not None:
+                self.set_error("Дождитесь завершения текущей команды.")
+                return
+            self.poweroff_pending = True
+            self.drop_lease()
+            self.set_error("")
+            self.refresh()
+            try:
+                sent = await safe_poweroff(robot, session, password.value or "", active)
+            except PoweroffUnconfirmed:
+                await self.disconnect()
+                self.connection_status.value = "Связь потеряна. Проверьте, выключился ли Pi."
+            except (RobotError, SshError) as exc:
+                if active():
+                    self.set_error(str(exc))
+            else:
+                if sent:
+                    await self.disconnect()
+                    self.connection_status.value = "Отправлена команда выключения Pi"
+        finally:
+            password.value = ""
+            self.poweroff_dialog = self.poweroff_pending = False
+            self.refresh()
+
     async def reset_safety(self, event: ft.ControlEvent) -> None:
         robot = self.robot
         if robot is not None and not self.reset_button.disabled:
@@ -686,6 +870,9 @@ class Dashboard:
 
     async def disconnect_page(self, event: ft.ControlEvent) -> None:
         self.page_available = False
+        if self.ssh_session is not None or self.ssh_task is not None:
+            await self.disconnect()
+            return
         self.drop_lease()
         task = self.close_observability()
         files_task = self.close_files()
