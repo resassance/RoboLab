@@ -23,12 +23,12 @@ def test_release_staging_includes_only_tracked_sources(tmp_path, platform, pytho
         "common/protocol.py": "",
         "agent/main.py": "",
         "examples/mock_robot.py": "",
-        "examples/mock_robot.json": "{}\n",
+        "examples/mock_robot.json": "{}\r\n",
     }
     for name, content in files.items():
         path = repository / name
         path.parent.mkdir(exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path.write_bytes(content.encode("utf-8"))
     subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
     subprocess.run(["git", "add", "--", *files], cwd=repository, check=True)
     (repository / "client" / "untracked.py").write_text("TOKEN = 'private'\n", encoding="utf-8")
@@ -55,7 +55,10 @@ def test_release_staging_includes_only_tracked_sources(tmp_path, platform, pytho
             "examples/mock_robot.py",
             "examples/mock_robot.json",
         }
-        assert bundle.read("examples/mock_robot.json") == b"{}\n"
+        assert (
+            bundle.read("examples/mock_robot.json")
+            == (repository / "examples/mock_robot.json").read_bytes()
+        )
     assert "from client.main import main" in (destination / "main.py").read_text(encoding="utf-8")
     with (destination / "pyproject.toml").open("rb") as stream:
         project = tomllib.load(stream)
