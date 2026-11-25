@@ -7,19 +7,10 @@ from pathlib import Path
 from typing import TypeVar
 from uuid import uuid4
 
-DEFAULT_UPLOAD_BYTES = 32 * 1024 * 1024
+from common.file_paths import DEFAULT_UPLOAD_BYTES as DEFAULT_UPLOAD_BYTES
+from common.file_paths import UPLOAD_PREFIX, valid_name
+
 T = TypeVar("T")
-
-
-def valid_name(name: str) -> bool:
-    return (
-        name.isprintable()
-        and name not in {".", ".."}
-        and not name.startswith(".robolab-upload-")
-        and "/" not in name
-        and "\\" not in name
-        and len(name.encode("utf-8")) <= 255
-    )
 
 
 @contextmanager
@@ -88,7 +79,7 @@ class FileUpload:
     def __init__(self, root: Path, path: list[str], name: str) -> None:
         self.location = directory((*root.parts[1:], *path))
         self.name = name
-        self.staging = f".robolab-upload-{uuid4().hex}"
+        self.staging = f"{UPLOAD_PREFIX}{uuid4().hex}"
         self.folder: int | None = None
         self.fd: int | None = None
 

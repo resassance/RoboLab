@@ -9,14 +9,26 @@ from uuid import UUID
 
 import flet as ft
 
+from client.appearance import (
+    AMBER,
+    AMBER_TINT,
+    CONTROL_RADIUS,
+    ERROR,
+    ERROR_TINT,
+    LINE,
+    MUTED,
+    SUCCESS,
+    SUCCESS_TINT,
+    SURFACE,
+    TEAL,
+    TEAL_TINT,
+    TEXT,
+    button_row,
+)
 from client.connection import RobotConnection, RobotError
+from client.sftp_files import SftpFiles
 from common.protocol import FileStorage
 
-SURFACE = "#222935"
-BORDER = "#394352"
-TEXT_MUTED = "#ADB8C8"
-BLUE = "#0A9DE2"
-ERROR = "#FFB4A9"
 BLOCK = 128 * 1024
 
 
@@ -80,7 +92,7 @@ class FilePanel:
     def __init__(
         self,
         page: ft.Page,
-        robot: RobotConnection,
+        robot: RobotConnection | SftpFiles,
         picker: ft.FilePicker,
         back: Callable[[ft.ControlEvent], Awaitable[None]],
         compact: bool,
@@ -100,81 +112,75 @@ class FilePanel:
         self.sent = 0
         self.compact = compact
 
-        self.back = ft.IconButton(ft.Icons.ARROW_BACK, tooltip="К запуску", on_click=back)
+        self.back = ft.IconButton(ft.Icons.ARROW_BACK, tooltip="К работе", on_click=back)
         self.reload = ft.IconButton(
             ft.Icons.REFRESH, tooltip="Обновить папки", on_click=self.reload_folders
         )
-        self.breadcrumb = ft.Row(spacing=2, scroll=ft.ScrollMode.AUTO)
-        self.folders_view = ft.ListView(expand=True, spacing=1)
-        self.pick = ft.OutlinedButton(
-            "Выбрать файл", icon=ft.Icons.UPLOAD_FILE_OUTLINED, on_click=self.pick_file
+        self.heading = ft.Text("Файлы", size=34, weight=ft.FontWeight.W_700, expand=True)
+        self.breadcrumb = ft.Row(spacing=4, scroll=ft.ScrollMode.AUTO, auto_scroll=True)
+        self.folders_view = ft.ListView(expand=True, spacing=0)
+        self.pick = ft.FilledButton(
+            "Выбрать файл", icon=ft.Icons.UPLOAD_FILE_OUTLINED, height=44, on_click=self.pick_file
+        )
+        self.replace = ft.OutlinedButton(
+            "Другой файл", icon=ft.Icons.UPLOAD_FILE_OUTLINED, height=44, on_click=self.pick_file
         )
         self.filename = ft.Text(expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
-        self.destination = ft.Text(color=TEXT_MUTED, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)
-        self.send = ft.FilledButton(
-            "Отправить",
-            height=46,
-            style=ft.ButtonStyle(
-                bgcolor={ft.ControlState.DEFAULT: BLUE, ft.ControlState.DISABLED: "#343C4A"},
-                color={ft.ControlState.DEFAULT: "#101B27", ft.ControlState.DISABLED: TEXT_MUTED},
-                shape=ft.RoundedRectangleBorder(radius=8),
-            ),
-            on_click=self.start_upload,
+        self.destination = ft.Text(color=MUTED, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)
+        self.send = ft.FilledButton("Отправить", height=44, on_click=self.start_upload)
+        self.cancel = ft.OutlinedButton("Отменить отправку", height=44, on_click=self.cancel_upload)
+        self.progress = ft.ProgressBar(expand=True, value=0, color=AMBER, bar_height=5)
+        self.progress_label = ft.Text(size=13, color=AMBER)
+        self.notice = ft.Text(size=14, selectable=True, visible=False)
+        self.feedback = ft.Container(
+            self.notice,
+            padding=ft.Padding.symmetric(vertical=10, horizontal=12),
+            border_radius=CONTROL_RADIUS,
+            visible=False,
         )
-        self.cancel = ft.OutlinedButton("Отмена", height=44, on_click=self.cancel_upload)
-        self.progress = ft.ProgressBar(expand=True, value=0, color=BLUE, bar_height=6)
-        self.progress_label = ft.Text(size=13)
-        self.notice = ft.Text(size=13, selectable=True, visible=False)
         self.summary = ft.ResponsiveRow(
             [
                 ft.Row(
-                    [ft.Icon(ft.Icons.DESCRIPTION_OUTLINED, size=21), self.filename],
-                    col={"xs": 12, "md": 4},
+                    [ft.Icon(ft.Icons.DESCRIPTION_OUTLINED, color=TEAL, size=20), self.filename],
+                    col={"xs": 12, "md": 6},
                 ),
-                ft.Container(self.destination, col={"xs": 12, "md": 5}),
-                ft.Row(
-                    [self.send, self.cancel],
-                    col={"xs": 12, "md": 3},
-                    spacing=8,
-                    alignment=ft.MainAxisAlignment.END,
-                ),
+                ft.Container(self.destination, col={"xs": 12, "md": 6}),
             ],
             spacing=10,
             run_spacing=8,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
-        self.progress_row = ft.Row([self.progress, self.progress_label], spacing=10)
-        self.tray = ft.Container(
-            bgcolor=SURFACE,
-            border=ft.Border.all(1, BORDER),
-            border_radius=8,
+        self.selection = ft.Container(
+            self.summary,
+            bgcolor=TEAL_TINT,
+            border_radius=CONTROL_RADIUS,
             padding=12,
+        )
+        self.actions = button_row(self.pick, self.replace, self.send, self.cancel)
+        self.progress_row = ft.Container(
+            ft.Row([self.progress, self.progress_label], spacing=10),
+            bgcolor=AMBER_TINT,
+            border_radius=CONTROL_RADIUS,
+            padding=12,
+        )
+        self.tray = ft.Container(
+            border=ft.Border.only(top=ft.BorderSide(1, LINE)),
+            padding=ft.Padding.only(top=16, bottom=4),
             content=ft.Column(
-                [self.pick, self.summary, self.progress_row, self.notice],
-                spacing=9,
+                [self.selection, self.progress_row, self.feedback, self.actions],
+                spacing=12,
                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
         )
         self.content = ft.Container(
             expand=True,
-            padding=ft.Padding.all(16),
             content=ft.Column(
                 [
-                    ft.Row(
-                        [
-                            self.back,
-                            ft.Text(
-                                "Папки робота", size=25, weight=ft.FontWeight.W_600, expand=True
-                            ),
-                            self.reload,
-                        ],
-                        spacing=3,
-                    ),
+                    ft.Row([self.back, self.heading, self.reload], spacing=4),
                     ft.Container(
-                        bgcolor=SURFACE,
-                        border=ft.Border.all(1, BORDER),
-                        border_radius=8,
-                        padding=ft.Padding.symmetric(horizontal=8, vertical=2),
+                        bgcolor=TEAL_TINT,
+                        border_radius=CONTROL_RADIUS,
+                        padding=ft.Padding.symmetric(horizontal=6, vertical=2),
                         content=self.breadcrumb,
                     ),
                     self.folders_view,
@@ -189,7 +195,10 @@ class FilePanel:
     def set_compact(self, compact: bool) -> None:
         self.compact = compact
         self.back.visible = compact
-        self.content.padding = ft.Padding.all(10 if compact else 18)
+        self.heading.size = 28 if compact else 34
+        self.content.padding = ft.Padding.symmetric(
+            horizontal=16 if compact else 26, vertical=14 if compact else 22
+        )
 
     def start(self) -> None:
         self.request(self.load_storage)
@@ -290,7 +299,7 @@ class FilePanel:
                 await task
             if self.task is task:
                 self.task, self.sending = None, False
-                self.message("Отправка отменена.")
+                self.message("Отправка отменена.", warning=True)
                 self.refresh()
 
     async def upload(self, file: ft.FilePickerFile, root: str, path: tuple[str, ...]) -> None:
@@ -316,7 +325,8 @@ class FilePanel:
             self.message(
                 "Отправка отменена. Проверьте папку на роботе."
                 if self.sent >= file.size
-                else "Отправка отменена."
+                else "Отправка отменена.",
+                warning=True,
             )
             raise
         else:
@@ -344,10 +354,21 @@ class FilePanel:
                 path.unlink()
                 path.parent.rmdir()
 
-    def message(self, value: str, *, error: bool = False) -> None:
+    def message(self, value: str, *, error: bool = False, warning: bool = False) -> None:
         self.notice.value = value
-        self.notice.color = ERROR if error else "#9CE4D0"
-        self.notice.visible = bool(value)
+        color, tint = (
+            (ERROR, ERROR_TINT)
+            if error
+            else (AMBER, AMBER_TINT)
+            if warning
+            else (
+                SUCCESS,
+                SUCCESS_TINT,
+            )
+        )
+        self.notice.color = color
+        self.feedback.bgcolor = tint
+        self.notice.visible = self.feedback.visible = bool(value)
 
     def update_progress(self) -> None:
         if self.closed or self.file is None:
@@ -370,6 +391,7 @@ class FilePanel:
         self.breadcrumb.controls = [
             ft.IconButton(
                 ft.Icons.FOLDER_OUTLINED,
+                icon_color=TEAL,
                 tooltip="Рабочие папки",
                 data=(None, ()),
                 on_click=self.navigate,
@@ -378,17 +400,22 @@ class FilePanel:
         ]
         if self.root is not None:
             for index, part in enumerate((self.root, *self.path)):
-                self.breadcrumb.controls += [
-                    ft.Icon(ft.Icons.CHEVRON_RIGHT, size=16, color=TEXT_MUTED),
-                    ft.TextButton(
+                crumb = (
+                    ft.Text(part, color=TEAL, weight=ft.FontWeight.W_600)
+                    if index == len(self.path)
+                    else ft.TextButton(
                         part,
                         data=(self.root, self.path[:index]),
-                        disabled=busy or index == len(self.path),
+                        disabled=busy,
                         on_click=self.navigate,
-                    ),
+                    )
+                )
+                self.breadcrumb.controls += [
+                    ft.Icon(ft.Icons.CHEVRON_RIGHT, size=16, color=MUTED),
+                    crumb,
                 ]
         else:
-            self.breadcrumb.controls.append(ft.Text("Рабочие папки", color=TEXT_MUTED))
+            self.breadcrumb.controls.append(ft.Text("Рабочие папки", color=MUTED))
         entries = (
             [(name, (self.root, (*self.path, name))) for name in self.folders]
             if self.root is not None
@@ -400,11 +427,17 @@ class FilePanel:
             self.folders_view.controls = [
                 ft.Container(
                     bgcolor=SURFACE,
-                    border_radius=6,
+                    border=ft.Border.only(bottom=ft.BorderSide(1, LINE)),
                     content=ft.ListTile(
-                        leading=ft.Icon(ft.Icons.FOLDER_OUTLINED, size=24),
-                        title=ft.Text(name, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                        trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT, color=TEXT_MUTED, size=22),
+                        leading=ft.Icon(ft.Icons.FOLDER_OUTLINED, color=TEAL, size=22),
+                        title=ft.Text(
+                            name,
+                            color=TEXT,
+                            max_lines=1,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                        ),
+                        trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT, color=MUTED, size=20),
+                        content_padding=ft.Padding.symmetric(horizontal=10),
                         data=location,
                         disabled=busy,
                         on_click=self.navigate,
@@ -415,27 +448,29 @@ class FilePanel:
         else:
             note = (
                 "Загружаем папки…"
-                if busy
+                if self.task is not None and not self.sending
                 else "В этой папке нет вложенных папок."
                 if self.root is not None
                 else "Выберите рабочую папку."
                 if self.storage is not None
                 else "Папки робота пока недоступны."
             )
-            self.folders_view.controls = [ft.Container(ft.Text(note, color=TEXT_MUTED), padding=12)]
-        self.pick.disabled = busy or self.storage is None
-        self.pick.visible = not self.sending
-        self.pick.content = "Выбрать другой файл" if self.file is not None else "Выбрать файл"
-        self.filename.value = (
-            f"{self.file.name} · {file_size(self.file.size)}" if self.file else "Файл не выбран"
-        )
+            self.folders_view.controls = [ft.Container(ft.Text(note, color=MUTED), padding=12)]
+        self.pick.disabled = self.replace.disabled = busy or self.storage is None
+        self.pick.visible = self.file is None and not self.sending
+        self.replace.visible = self.file is not None and not self.sending
+        self.selection.visible = self.file is not None
+        self.filename.value = f"{self.file.name} · {file_size(self.file.size)}" if self.file else ""
         destination = (
             " / ".join((self.root, *self.path)) if self.root is not None else "Выберите папку"
         )
         self.destination.value = f"Куда: {destination}"
-        self.send.visible = not self.sending
+        self.send.visible = self.file is not None and not self.sending
         self.send.disabled = busy or self.root is None or self.file is None
         self.cancel.visible = self.sending
+        self.actions.controls = [
+            button for button in (self.pick, self.replace, self.send, self.cancel) if button.visible
+        ]
         self.progress_row.visible = self.sending
         if self.sending and self.sent == 0:
             self.progress.value = 0

@@ -20,6 +20,9 @@ class FakeRobot:
         self.token_file = root / ".config" / "robolab" / "token"
         self.token_file.parent.mkdir(parents=True)
         self.token_file.write_bytes(TOKEN.encode("ascii") + b"\r\n")
+        self.sftp_factory = lambda channel: asyncssh.SFTPServer(
+            channel, chroot=os.fsencode(self.root)
+        )
 
     async def process(self, process):
         self.commands.append((process.command, await process.stdin.read(), process.term_type))
@@ -65,9 +68,7 @@ class FakeRobot:
                 server_factory=PasswordServer,
                 server_host_keys=[self.key],
                 process_factory=self.process,
-                sftp_factory=lambda channel: asyncssh.SFTPServer(
-                    channel, chroot=os.fsencode(self.root)
-                ),
+                sftp_factory=self.sftp_factory,
                 encoding=None,
                 allow_pty=False,
             ) as listener:
@@ -93,10 +94,11 @@ def test_pin_is_required_before_password_and_forwarding_uses_only_loopback(tmp_p
 
             session = await SshSession.connect(target, PASSWORD, fingerprint)
             try:
-                assert session.token == TOKEN
+                address, token = await session.use_existing_agent()
+                assert token == TOKEN
                 assert not session.closed
                 assert robot.passwords == [("pi", PASSWORD)]
-                host, _, port = session.address.removeprefix("http://").rpartition(":")
+                host, _, port = address.removeprefix("http://").rpartition(":")
                 assert host == "127.0.0.1"
                 reader, writer = await asyncio.open_connection(host, int(port))
                 try:
@@ -117,6 +119,50 @@ def test_pin_is_required_before_password_and_forwarding_uses_only_loopback(tmp_p
     asyncio.run(check())
 
 
+@pytest.mark.parametrize(
+    ("problem", "message"),
+    [
+        ("missing", "нет файла ~/.config/robolab/token"),
+        ("denied", "права на ~/.config/robolab/token"),
+        ("unavailable", "не открыл канал SFTP"),
+    ],
+)
+def test_reports_token_setup_problem_after_password_authentication(tmp_path, problem, message):
+    from client.ssh import SshError, SshSession
+
+    class UnreadableTokenServer(asyncssh.SFTPServer):
+        def lstat(self, path):
+            raise asyncssh.SFTPPermissionDenied("synthetic server details")
+
+    async def check():
+        robot = FakeRobot(tmp_path)
+        if problem == "missing":
+            robot.token_file.unlink()
+        elif problem == "denied":
+            robot.sftp_factory = UnreadableTokenServer
+        else:
+            robot.sftp_factory = None
+
+        async with robot.listening() as target:
+            session = await SshSession.connect(
+                target, PASSWORD, robot.key.get_fingerprint("sha256")
+            )
+            try:
+                with pytest.raises(SshError) as error:
+                    await session.use_existing_agent()
+                assert not session.closed
+            finally:
+                await session.close()
+
+        assert str(error.value).startswith("SSH-вход выполнен.")
+        assert message in str(error.value)
+        assert "synthetic server details" not in str(error.value)
+        assert robot.passwords == [("pi", PASSWORD)]
+        assert not robot.forwarding
+
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize("payload", [b"x" * 259, TOKEN.encode() + b"\n\n", b"!" * 40])
 def test_malformed_token_prevents_session(tmp_path, payload):
     from client.ssh import SshError, SshSession
@@ -125,9 +171,15 @@ def test_malformed_token_prevents_session(tmp_path, payload):
         robot = FakeRobot(tmp_path)
         robot.token_file.write_bytes(payload)
         async with robot.listening() as target:
-            with pytest.raises(SshError, match="токен") as error:
-                await SshSession.connect(target, PASSWORD, robot.key.get_fingerprint("sha256"))
-            assert TOKEN not in str(error.value)
+            session = await SshSession.connect(
+                target, PASSWORD, robot.key.get_fingerprint("sha256")
+            )
+            try:
+                with pytest.raises(SshError, match="токен") as error:
+                    await session.use_existing_agent()
+                assert TOKEN not in str(error.value)
+            finally:
+                await session.close()
         assert not robot.forwarding
 
     asyncio.run(check())

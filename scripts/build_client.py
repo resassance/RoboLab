@@ -6,6 +6,7 @@ import sys
 import tomllib
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from zipfile import ZIP_DEFLATED, ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = """import flet as ft
@@ -38,6 +39,28 @@ def stage_client(root: Path, destination: Path, *, platform: str = "linux") -> s
         target = destination / path
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
+
+    agent_paths = subprocess.check_output(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--",
+            "agent/*.py",
+            "common/*.py",
+            "examples/__init__.py",
+            "examples/mock_robot.py",
+            "examples/mock_robot.json",
+            "client/ssh_agent_remote.py",
+        ],
+        cwd=root,
+    ).decode("utf-8")
+    with ZipFile(destination / "client" / "robolab-agent.zip", "x", ZIP_DEFLATED) as archive:
+        for name in filter(None, agent_paths.split("\0")):
+            path = root / name
+            if path.is_symlink():
+                raise ValueError(f"Cannot package a symbolic link: {name}")
+            archive.write(path, name)
 
     (destination / "main.py").write_text(LAUNCHER, encoding="utf-8")
     (destination / "pyproject.toml").write_text(

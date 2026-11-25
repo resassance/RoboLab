@@ -4,6 +4,20 @@ from uuid import UUID
 
 import flet as ft
 
+from client.appearance import (
+    AMBER,
+    AMBER_TINT,
+    CONTROL_RADIUS,
+    ERROR,
+    LINE,
+    MUTED,
+    SUCCESS,
+    SURFACE,
+    TEAL,
+    TEAL_TINT,
+    TEXT,
+    button_row,
+)
 from client.connection import CameraFrame, RobotConnection, RobotError
 from common.protocol import CameraOptions
 
@@ -15,13 +29,13 @@ VIEWS = {
 }
 
 
-class CameraDialog:
+class CameraPanel:
     def __init__(
         self,
         page: ft.Page,
         robot: RobotConnection,
         picker: ft.FilePicker,
-        on_closed: Callable[["CameraDialog"], None],
+        on_closed: Callable[["CameraPanel"], None],
     ) -> None:
         self.page = page
         self.robot = robot
@@ -33,20 +47,14 @@ class CameraDialog:
         self.pulling = False
         self.stopping = False
         self.saving = False
+        self.run_active = False
+        self.compact = False
 
         defaults = CameraOptions()
-        self.view = ft.RadioGroup(
+        self.view = ft.Dropdown(
+            label="Вид изображения",
             value=defaults.view,
-            content=ft.Column(
-                [
-                    ft.Text("Вид"),
-                    ft.Row(
-                        [ft.Radio(value=key, label=label) for key, label in VIEWS.items()],
-                        wrap=True,
-                    ),
-                ],
-                spacing=2,
-            ),
+            options=[ft.DropdownOption(key=key, text=label) for key, label in VIEWS.items()],
         )
         self.fps = ft.Slider(
             min=1,
@@ -73,65 +81,170 @@ class CameraDialog:
             visible=False,
             semantics_label="Кадр с камеры робота",
         )
-        self.empty = ft.Container(content=ft.Text("Кадра пока нет"), alignment=ft.Alignment.CENTER)
-        self.status = ft.Text("Просмотр выключен.", color="#A7B7CB")
-        self.info = ft.Text(color="#A7B7CB", size=12, visible=False)
-        self.error = ft.Text(color="#FFB4A9", visible=False)
-        self.file_notice = ft.Text(visible=False)
-        self.start_button = ft.FilledButton("Начать просмотр", on_click=self.start)
-        self.stop_button = ft.OutlinedButton("Остановить", disabled=True, on_click=self.stop)
-        self.save_button = ft.OutlinedButton("Сохранить JPEG", disabled=True, on_click=self.save)
-        self.dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Камера"),
-            content=ft.Container(
-                width=560,
-                content=ft.Column(
-                    [
-                        ft.Container(
-                            height=min(300, max(140, (page.height or 720) * 0.38)),
-                            bgcolor="#0D1623",
-                            border_radius=8,
-                            clip_behavior=ft.ClipBehavior.HARD_EDGE,
-                            content=ft.Stack([self.empty, self.image], fit=ft.StackFit.EXPAND),
-                        ),
-                        self.info,
-                        self.status,
-                        self.error,
-                        self.view,
-                        ft.Row(
-                            [
-                                ft.Column([self.fps_label, self.fps], spacing=2, expand=True),
-                                ft.Column(
-                                    [self.quality_label, self.quality], spacing=2, expand=True
-                                ),
-                            ],
-                            vertical_alignment=ft.CrossAxisAlignment.START,
-                        ),
-                        ft.Row([self.start_button, self.stop_button, self.save_button], wrap=True),
-                        self.file_notice,
-                    ],
-                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                    spacing=10,
-                ),
+        self.empty = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Icon(ft.Icons.VIDEOCAM_OUTLINED, color=SURFACE, size=30),
+                    ft.Text("Кадра пока нет", color=SURFACE, size=14),
+                ],
+                tight=True,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=8,
             ),
-            scrollable=True,
-            actions=[ft.TextButton("Закрыть", on_click=self.dismiss)],
-            on_dismiss=self.dismissed,
+            alignment=ft.Alignment.CENTER,
+        )
+        self.status = ft.Text("Просмотр выключен.", color=MUTED)
+        self.compact_status = ft.Text(
+            self.status.value,
+            color=MUTED,
+            size=11,
+            max_lines=1,
+            overflow=ft.TextOverflow.ELLIPSIS,
+            text_align=ft.TextAlign.RIGHT,
+            expand=True,
+            visible=False,
+        )
+        self.status_strip = ft.Container(
+            self.status,
+            bgcolor=TEAL_TINT,
+            border_radius=CONTROL_RADIUS,
+            padding=ft.Padding.symmetric(horizontal=8, vertical=6),
+        )
+        self.info = ft.Text(color=MUTED, size=13, visible=False)
+        self.error = ft.Text(color=ERROR, visible=False)
+        self.file_notice = ft.Text(size=14, visible=False)
+        self.run_notice = ft.Container(
+            ft.Text(size=13, color=AMBER),
+            bgcolor=AMBER_TINT,
+            border_radius=CONTROL_RADIUS,
+            padding=ft.Padding.symmetric(horizontal=8, vertical=6),
+            visible=False,
+        )
+        action_style = ft.ButtonStyle(
+            padding=ft.Padding.symmetric(horizontal=4),
+            shape=ft.RoundedRectangleBorder(radius=CONTROL_RADIUS),
+        )
+        self.start_button = ft.FilledButton(
+            ft.Text("Запустить", size=12, text_align=ft.TextAlign.CENTER),
+            tooltip="Начать просмотр камеры",
+            height=44,
+            on_click=self.start,
+            style=action_style,
+        )
+        self.stop_button = ft.OutlinedButton(
+            ft.Text("Стоп", size=12, text_align=ft.TextAlign.CENTER),
+            tooltip="Остановить просмотр камеры",
+            height=44,
+            disabled=True,
+            on_click=self.stop,
+            style=action_style,
+        )
+        self.save_button = ft.OutlinedButton(
+            ft.Text("Сохранить", size=12, text_align=ft.TextAlign.CENTER),
+            tooltip="Сохранить кадр JPEG",
+            height=44,
+            disabled=True,
+            on_click=self.save,
+            style=action_style,
+        )
+        self.preview = ft.Container(
+            height=245,
+            bgcolor=TEXT,
+            border_radius=CONTROL_RADIUS,
+            clip_behavior=ft.ClipBehavior.HARD_EDGE,
+            content=ft.Stack([self.empty, self.image], fit=ft.StackFit.EXPAND),
+        )
+        settings = ft.ExpansionTile(
+            title=ft.Text("Параметры камеры", size=13, weight=ft.FontWeight.W_600),
+            controls=[
+                self.info,
+                self.view,
+                ft.ResponsiveRow(
+                    [
+                        ft.Column([self.fps_label, self.fps], spacing=2, col={"xs": 12, "sm": 6}),
+                        ft.Column(
+                            [self.quality_label, self.quality], spacing=2, col={"xs": 12, "sm": 6}
+                        ),
+                    ],
+                    spacing=10,
+                    run_spacing=6,
+                ),
+            ],
+            expanded_cross_axis_alignment=ft.CrossAxisAlignment.STRETCH,
+            tile_padding=ft.Padding.symmetric(horizontal=8),
+            min_tile_height=32,
+            maintain_state=True,
+        )
+        self.content = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Icon(ft.Icons.VIDEOCAM_OUTLINED, size=21, color=TEAL),
+                            ft.Text("Камера", size=21, weight=ft.FontWeight.W_700, color=TEXT),
+                            self.compact_status,
+                        ],
+                        spacing=8,
+                    ),
+                    self.preview,
+                    button_row(self.start_button, self.stop_button, self.save_button, spacing=6),
+                    self.status_strip,
+                    self.run_notice,
+                    self.error,
+                    self.file_notice,
+                    settings,
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                spacing=8,
+            ),
+            bgcolor=SURFACE,
+            border=ft.Border.all(1, LINE),
+            border_radius=CONTROL_RADIUS,
+            padding=12,
         )
 
-    def show(self) -> None:
-        self.page.show_dialog(self.dialog)
+    def set_compact(self, compact: bool) -> None:
+        self.compact = compact
+        self.preview.height = 132 if compact else 245
+        self.update_controls()
+
+    def set_run_active(self, active: bool) -> None:
+        self.run_active = active
+        self.update_controls()
+
+    async def pause_for_run(self) -> None:
+        task = self.task
+        if task is not None:
+            self.status.value = "Останавливаем просмотр…"
+            self.request_stop()
+            self.refresh()
+            await asyncio.shield(task)
 
     def refresh(self) -> None:
         if self.closed:
             return
+        self.update_controls()
+        if self.content.parent is not None:
+            self.content.update()
+
+    def update_controls(self) -> None:
         running = self.task is not None
         self.view.disabled = self.fps.disabled = self.quality.disabled = running
-        self.start_button.disabled = running
+        self.start_button.disabled = running or self.run_active
         self.stop_button.disabled = not running or self.stopping
         self.save_button.disabled = self.frame is None or self.saving
-        self.dialog.update()
+        self.status.color = TEAL if running and not self.stopping else MUTED
+        show_status = running or not self.run_active
+        self.status_strip.visible = show_status and not self.compact
+        self.compact_status.visible = show_status and self.compact
+        self.compact_status.value = self.status.value
+        self.compact_status.color = self.status.color
+        self.run_notice.visible = self.run_active
+        self.run_notice.content.value = (
+            "Во время аппаратного запуска показан последний кадр."
+            if self.frame is not None
+            else "Просмотр камеры доступен после завершения аппаратного запуска."
+        )
 
     async def update_settings(self, event: ft.ControlEvent) -> None:
         self.fps_label.value = f"Частота · {self.fps.value:.0f} FPS"
@@ -152,7 +265,7 @@ class CameraDialog:
         )
 
     async def start(self, event: ft.ControlEvent) -> None:
-        if self.closed or self.task is not None:
+        if self.closed or self.task is not None or self.run_active:
             return
         self.show_frame(None)
         self.error.visible = self.file_notice.visible = False
@@ -248,17 +361,11 @@ class CameraDialog:
         self.closed = True
         self.request_stop()
         self.show_frame(None)
-        was_open, self.dialog.open = self.dialog.open, False
-        if update and was_open:
-            self.dialog.update()
+        self.content.visible = False
+        if update and self.content.parent is not None:
+            self.content.update()
         if self.task is None:
             self.on_closed(self)
-
-    async def dismiss(self, event: ft.ControlEvent) -> None:
-        self.close(update=True)
-
-    async def dismissed(self, event: ft.ControlEvent) -> None:
-        self.close(update=False)
 
     async def save(self, event: ft.ControlEvent) -> None:
         frame = self.frame
@@ -277,14 +384,14 @@ class CameraDialog:
             )
         except (OSError, RuntimeError, TimeoutError, ValueError):
             self.file_notice.value = "Не удалось сохранить JPEG на этом устройстве."
-            self.file_notice.color = "#FFB4A9"
+            self.file_notice.color = ERROR
             self.file_notice.visible = True
         else:
             if path is not None or self.page.web:
                 self.file_notice.value = (
                     "Загрузка передана браузеру." if self.page.web else "Кадр сохранён."
                 )
-                self.file_notice.color = "#70E0CD"
+                self.file_notice.color = SUCCESS
                 self.file_notice.visible = True
         finally:
             self.saving = False

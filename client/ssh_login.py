@@ -6,6 +6,18 @@ import flet as ft
 from flet_secure_storage import SecureStorage
 from pydantic import BaseModel
 
+from client.appearance import (
+    CONTROL_RADIUS,
+    DANGER,
+    ERROR,
+    ERROR_TINT,
+    MUTED,
+    PRIMARY_TINT,
+    SUCCESS,
+    SUCCESS_TINT,
+    TEXT,
+    button_row,
+)
 from client.connection import RobotConnection, RobotError
 from client.ssh import HostKeyChanged, SshError, SshSession, SshTarget, UnknownHostKey
 
@@ -109,7 +121,9 @@ class SshProfiles:
                     raise RuntimeError("Не удалось удалить SSH-профиль.")
 
 
-async def confirm(page: ft.Page, title: str, content: ft.Control, action: str) -> bool:
+async def confirm(
+    page: ft.Page, title: str, content: ft.Control, action: str, *, danger: bool = False
+) -> bool:
     result: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
 
     def answer(value: bool) -> None:
@@ -126,9 +140,18 @@ async def confirm(page: ft.Page, title: str, content: ft.Control, action: str) -
         modal=True,
         title=ft.Text(title),
         content=content,
+        scrollable=True,
+        inset_padding=ft.Padding.symmetric(horizontal=20, vertical=18),
         actions=[
-            ft.TextButton("Отмена", on_click=decline),
-            ft.FilledButton(action, on_click=accept),
+            button_row(
+                ft.OutlinedButton("Отмена", height=44, on_click=decline),
+                ft.FilledButton(
+                    ft.Text(action, text_align=ft.TextAlign.CENTER),
+                    height=44,
+                    on_click=accept,
+                    style=ft.ButtonStyle(bgcolor=DANGER) if danger else None,
+                ),
+            )
         ],
         on_dismiss=decline,
     )
@@ -159,12 +182,19 @@ class SshLogin:
         self.username = ft.TextField(label="Имя пользователя SSH", on_change=self.target_changed)
         self.password = ft.TextField(label="Пароль SSH", password=True, can_reveal_password=True)
         self.remember = ft.Checkbox(label="Запомнить пароль", value=False)
-        self.error = ft.Text(color="#FFB4A9", visible=False)
-        self.forget_button = ft.TextButton(
-            "Забыть подключение", on_click=self.forget, visible=False
+        self.error = ft.Text(color=ERROR, visible=False)
+        self.feedback = ft.Container(
+            self.error,
+            bgcolor=ERROR_TINT,
+            border_radius=CONTROL_RADIUS,
+            padding=12,
+            visible=False,
         )
-        self.forget_key_button = ft.TextButton(
-            "Забыть ключ SSH", on_click=self.forget_mismatched_key, visible=False
+        self.forget_button = ft.OutlinedButton(
+            "Забыть подключение", height=44, on_click=self.forget, visible=False
+        )
+        self.forget_key_button = ft.OutlinedButton(
+            "Забыть ключ SSH", height=44, on_click=self.forget_mismatched_key, visible=False
         )
         self.control = ft.Column(
             [
@@ -177,16 +207,19 @@ class SshLogin:
                     spacing=8,
                 ),
                 self.password,
-                ft.Row([self.remember, self.forget_button], wrap=True),
-                self.error,
+                self.remember,
+                self.feedback,
+                self.forget_button,
                 self.forget_key_button,
             ],
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         )
 
-    def message(self, message: str) -> None:
+    def message(self, message: str, *, success: bool = False) -> None:
         self.error.value = message
-        self.error.visible = bool(message)
+        self.error.color = SUCCESS if success else ERROR
+        self.feedback.bgcolor = SUCCESS_TINT if success else ERROR_TINT
+        self.error.visible = self.feedback.visible = bool(message)
 
     async def restore(self) -> None:
         try:
@@ -247,9 +280,19 @@ class SshLogin:
                 "Проверка ключа Raspberry Pi",
                 ft.Column(
                     [
-                        ft.Text(f"{target.host}:{target.port}"),
-                        ft.Text(exc.fingerprint, selectable=True),
-                        ft.Text("Сверьте отпечаток с ключом SSH на Raspberry Pi."),
+                        ft.Text(f"{target.host}:{target.port}", color=MUTED),
+                        ft.Container(
+                            ft.Text(
+                                exc.fingerprint,
+                                font_family="monospace",
+                                color=TEXT,
+                                selectable=True,
+                            ),
+                            bgcolor=PRIMARY_TINT,
+                            border_radius=CONTROL_RADIUS,
+                            padding=12,
+                        ),
+                        ft.Text("Сверьте отпечаток с ключом SSH на Raspberry Pi.", color=MUTED),
                     ],
                     tight=True,
                 ),
@@ -314,7 +357,7 @@ class SshLogin:
                 await self.profiles.forget_key(target)
                 self.mismatched = None
                 self.forget_key_button.visible = False
-                self.message("Ключ удалён. Подключитесь и проверьте новый отпечаток.")
+                self.message("Ключ удалён. Подключитесь и проверьте новый отпечаток.", success=True)
         except (RuntimeError, TimeoutError):
             self.message("Не удалось удалить ключ SSH.")
         finally:

@@ -6,6 +6,8 @@ from typing import Self
 
 import asyncssh
 
+from client.sftp_files import SftpFiles
+from client.ssh_agent import AgentStartError, StartedAgent, start_agent
 from common.protocol import valid_token
 
 LOOPBACK = "127.0.0.1"
@@ -100,8 +102,14 @@ async def _read_token(connection: asyncssh.SSHClientConnection) -> str:
                     if not chunk:
                         break
                     data.extend(chunk)
-    except (asyncssh.Error, OSError, TimeoutError) as exc:
-        raise SshError("Не удалось прочитать файл токена RoboLab по SFTP.") from exc
+    except (asyncssh.SFTPNoSuchFile, asyncssh.SFTPNoSuchPath) as exc:
+        raise SshError(f"SSH-вход выполнен. На роботе нет файла ~/{TOKEN_PATH}.") from exc
+    except asyncssh.SFTPPermissionDenied as exc:
+        raise SshError(f"SSH-вход выполнен. Проверьте права на ~/{TOKEN_PATH} на роботе.") from exc
+    except asyncssh.ChannelOpenError as exc:
+        raise SshError("SSH-вход выполнен. Сервер робота не открыл канал SFTP.") from exc
+    except (asyncssh.Error, OSError) as exc:
+        raise SshError(f"SSH-вход выполнен. Не удалось прочитать ~/{TOKEN_PATH} по SFTP.") from exc
 
     if len(data) > TOKEN_FILE_LIMIT:
         raise SshError("Файл токена RoboLab превышает допустимый размер.")
@@ -116,17 +124,22 @@ async def _read_token(connection: asyncssh.SSHClientConnection) -> str:
 
 
 class SshSession:
-    def __init__(
-        self, connection: asyncssh.SSHClientConnection, listener: asyncssh.SSHListener, token: str
-    ) -> None:
+    def __init__(self, connection: asyncssh.SSHClientConnection) -> None:
         self._connection = connection
-        self._listener = listener
-        self.address = f"http://{LOOPBACK}:{listener.get_port()}"
-        self.token = token
+        self._listener: asyncssh.SSHListener | None = None
+        self._agent: StartedAgent | None = None
+
+    @property
+    def files(self) -> SftpFiles:
+        return SftpFiles(self._connection)
 
     @property
     def closed(self) -> bool:
         return self._connection.is_closed()
+
+    @property
+    def manages_agent(self) -> bool:
+        return self._agent is not None
 
     @classmethod
     async def connect(cls, target: SshTarget, password: str, fingerprint: str | None) -> Self:
@@ -171,27 +184,68 @@ class SshSession:
             raise SshError("Не удалось подключиться к роботу по SSH.") from exc
         finally:
             verifier.password = None
+        return cls(connection)
 
+    async def wait_closed(self) -> None:
+        await self._connection.wait_closed()
+
+    async def use_existing_agent(self) -> tuple[str, str]:
+        token = await _read_token(self._connection)
+        return await self._open_tunnel(AGENT_PORT), token
+
+    async def prepare_agent(self, script_dir: str | None) -> tuple[str, str]:
+        if await self._has_existing_service():
+            return await self.use_existing_agent()
         try:
-            token = await _read_token(connection)
-            try:
-                async with asyncio.timeout(5):
-                    listener = await connection.forward_local_port(
-                        LOOPBACK, 0, LOOPBACK, AGENT_PORT
-                    )
-            except (asyncssh.Error, OSError, TimeoutError) as exc:
-                raise SshError("Не удалось открыть локальный туннель SSH.") from exc
-            return cls(connection, listener, token)
+            agent = await start_agent(self._connection, script_dir=script_dir)
+        except AgentStartError as exc:
+            raise SshError(str(exc)) from exc
+        try:
+            address = await self._open_tunnel(agent.port)
         except BaseException:
-            connection.abort()
+            await agent.close()
             raise
+        self._agent = agent
+        return address, agent.token
+
+    async def _has_existing_service(self) -> bool:
+        try:
+            async with asyncio.timeout(5):
+                _, writer = await self._connection.open_connection(LOOPBACK, AGENT_PORT)
+                writer.close()
+                await writer.wait_closed()
+        except asyncssh.ChannelOpenError as exc:
+            if exc.code == asyncssh.OPEN_CONNECT_FAILED:
+                return False
+            raise SshError("Сервер робота отклонил проброс порта SSH.") from exc
+        except (asyncssh.Error, OSError) as exc:
+            raise SshError("Не удалось проверить подключение к агенту через SSH.") from exc
+        return True
+
+    async def _open_tunnel(self, port: int) -> str:
+        try:
+            async with asyncio.timeout(5):
+                listener = await self._connection.forward_local_port(LOOPBACK, 0, LOOPBACK, port)
+        except (asyncssh.Error, OSError) as exc:
+            raise SshError("Не удалось открыть локальный туннель SSH.") from exc
+        self._listener = listener
+        return f"http://{LOOPBACK}:{listener.get_port()}"
+
+    async def close_agent(self) -> None:
+        listener, self._listener = self._listener, None
+        agent, self._agent = self._agent, None
+        if listener is not None:
+            listener.close()
+        if agent is not None:
+            await agent.close()
 
     async def close(self) -> None:
-        self._listener.close()
-        self._connection.close()
+        try:
+            await self.close_agent()
+        finally:
+            self._connection.close()
         try:
             async with asyncio.timeout(2):
-                await self._listener.wait_closed()
                 await self._connection.wait_closed()
         except TimeoutError:
             self._connection.abort()

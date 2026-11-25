@@ -9,6 +9,25 @@ from uuid import UUID
 import flet as ft
 import flet.canvas as cv
 
+from client.appearance import (
+    AMBER,
+    AMBER_TINT,
+    CONTROL_RADIUS,
+    ERROR,
+    ERROR_TINT,
+    LINE,
+    MUTED,
+    PRIMARY,
+    PRIMARY_TINT,
+    SUBTLE,
+    SUCCESS,
+    SUCCESS_TINT,
+    SURFACE,
+    TEAL,
+    TEAL_TINT,
+    TEXT,
+    button_row,
+)
 from client.connection import RobotConnection, RobotError
 from common.protocol import Experiment, ExperimentDetails, MetricSample, SystemTelemetry
 
@@ -20,9 +39,6 @@ RUN_STATUS = {
     "failed": "Завершён с ошибкой",
     "interrupted": "Прерван",
 }
-MUTED = "#A7B7CB"
-ACCENT = "#70E0CD"
-ERROR = "#FFB4A9"
 EMPTY = "—"
 MEBIBYTE = 2**20
 HISTORY_PAGE = 20
@@ -46,45 +62,102 @@ def measured(value: float | int | None, unit: str, *, scale: float = 1) -> str:
     return f"{value / scale:.1f} {unit}" if value is not None else "Нет данных"
 
 
+def section_title(label: str) -> ft.Text:
+    return ft.Text(label, size=17, weight=ft.FontWeight.W_600, color=TEXT)
+
+
 def field(label: str, value: str, *, col: dict[str, int] | int = 12) -> ft.Column:
-    return ft.Column([ft.Text(label, color=MUTED, size=12), ft.Text(value)], spacing=1, col=col)
-
-
-def table(rows: list[tuple[str, ...]]) -> ft.Column:
     return ft.Column(
         [
-            ft.Row(
-                [ft.Text(value, expand=True, size=13) for value in cells],
-                vertical_alignment=ft.CrossAxisAlignment.START,
-            )
-            for cells in rows
+            ft.Text(label, color=MUTED, size=13),
+            ft.Text(value, color=TEXT, size=14),
         ],
-        spacing=6,
+        spacing=4,
+        col=col,
+    )
+
+
+def table(rows: list[tuple[str, ...]], *, header: tuple[str, ...] = ()) -> ft.Column:
+    controls = []
+    for index, cells in enumerate([header, *rows] if header else rows):
+        heading = bool(header) and index == 0
+        controls.append(
+            ft.Container(
+                ft.Row(
+                    [
+                        ft.Text(
+                            value,
+                            expand=True,
+                            size=13,
+                            color=MUTED if heading else TEXT,
+                            weight=ft.FontWeight.W_600 if heading else None,
+                        )
+                        for value in cells
+                    ],
+                    spacing=10,
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                ),
+                bgcolor=SUBTLE if heading else None,
+                border=ft.Border.only(bottom=ft.BorderSide(1, LINE)),
+                padding=ft.Padding.symmetric(horizontal=10, vertical=10),
+            )
+        )
+    return ft.Column(
+        controls,
+        spacing=0,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
     )
 
 
 def scroll_lines(lines: list[str]) -> ft.Control:
     if not lines:
         return ft.Text("Нет записей.", color=MUTED)
-    return ft.SelectionArea(
-        content=ft.ListView(
-            [ft.Text(line, size=13) for line in lines],
-            spacing=5,
-            height=min(230, 24 * len(lines) + 12),
-        )
+    return ft.Container(
+        ft.SelectionArea(
+            content=ft.ListView(
+                [ft.Text(line, size=13, color=TEXT) for line in lines],
+                spacing=6,
+                height=min(230, max(54, 32 * len(lines))),
+            )
+        ),
+        bgcolor=SUBTLE,
+        border_radius=CONTROL_RADIUS,
+        padding=12,
     )
 
 
 class SeriesPlot:
-    def __init__(self) -> None:
+    def __init__(self, title: str, *, color: str = PRIMARY) -> None:
         self.width = 240.0
         self.points: list[tuple[datetime, float | None]] = []
+        self.color = color
         self.unit = ""
         self.limits: tuple[float, float] | None = None
-        self.graph = cv.Canvas(height=110, on_resize=self.resize)
+        self.graph = cv.Canvas(height=110, resize_interval=0, on_resize=self.resize)
         self.range = ft.Text(color=MUTED, size=12)
-        self.content = ft.Column(
-            [self.graph, self.range], horizontal_alignment=ft.CrossAxisAlignment.STRETCH
+        self.content = ft.Container(
+            ft.Column(
+                [
+                    ft.Text(
+                        title,
+                        color=color,
+                        weight=ft.FontWeight.W_600,
+                        max_lines=2,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                        tooltip=title,
+                    ),
+                    self.graph,
+                    self.range,
+                ],
+                spacing=6,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            ),
+            bgcolor=SURFACE,
+            border=ft.Border.all(1, LINE),
+            border_radius=CONTROL_RADIUS,
+            padding=12,
+            height=218,
+            col={"xs": 12, "md": 6},
         )
 
     async def resize(self, event: cv.CanvasResizeEvent) -> None:
@@ -117,8 +190,8 @@ class SeriesPlot:
         start, end = self.points[0][0], self.points[-1][0]
         span = (end - start).total_seconds()
         left, right, top, bottom = 5, self.width - 5, 5, 105
-        guide = ft.Paint(color="#43556B", stroke_width=1)
-        line = ft.Paint(color=ACCENT, stroke_width=2.5)
+        guide = ft.Paint(color=LINE, stroke_width=1)
+        line = ft.Paint(color=self.color, stroke_width=2.5)
         shapes = [cv.Line(left, y, right, y, guide) for y in (top, (top + bottom) / 2, bottom)]
         previous = None
         for when, value in self.points:
@@ -146,35 +219,21 @@ def history_chart(samples: list[MetricSample]) -> ft.Control:
     grouped: dict[str, list[tuple[datetime, float | None]]] = {}
     for sample in sorted(samples, key=lambda sample: sample.timestamp):
         grouped.setdefault(sample.name, []).append((sample.timestamp, sample.value))
-    series = sorted(grouped)
-    plot = SeriesPlot()
-    plot.set_values(grouped[series[0]])
-
-    async def select(event: ft.ControlEvent) -> None:
-        plot.set_values(grouped[event.control.value])
-        plot.content.update()
-
-    return ft.Column(
-        [
-            ft.Dropdown(
-                label="Ряд",
-                value=series[0],
-                options=[ft.DropdownOption(key=name, text=name) for name in series],
-                on_select=select,
-            ),
-            plot.content,
-        ],
-        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-    )
+    cards = []
+    for name, points in sorted(grouped.items()):
+        plot = SeriesPlot(name)
+        plot.set_values(points)
+        cards.append(plot.content)
+    return ft.ResponsiveRow(cards, spacing=12, run_spacing=12)
 
 
 class TelemetryPanel:
     SERIES = {
-        "cpu_percent": ("ЦП", "%", 1),
-        "ram_used_bytes": ("Занято ОЗУ", "МиБ", MEBIBYTE),
-        "temperature_c": ("Температура", "°C", 1),
-        "network_rx_bytes": ("Принято по сети", "МиБ", MEBIBYTE),
-        "network_tx_bytes": ("Передано по сети", "МиБ", MEBIBYTE),
+        "cpu_percent": ("Загрузка ЦП", "%", 1, PRIMARY),
+        "ram_used_bytes": ("Занято ОЗУ", "МиБ", MEBIBYTE, TEAL),
+        "temperature_c": ("Температура", "°C", 1, AMBER),
+        "network_rx_bytes": ("Принято по сети", "МиБ", MEBIBYTE, SUCCESS),
+        "network_tx_bytes": ("Передано по сети", "МиБ", MEBIBYTE, PRIMARY),
     }
 
     def __init__(self, robot: RobotConnection) -> None:
@@ -182,28 +241,60 @@ class TelemetryPanel:
         self.task: asyncio.Task[None] | None = None
         self.samples: deque[SystemTelemetry] = deque(maxlen=60)
         self.status = ft.Text("Получаем телеметрию…", color=MUTED)
-        self.readings = ft.ResponsiveRow(spacing=12, run_spacing=10, visible=False)
-        self.series = ft.Dropdown(
-            label="График",
-            value="cpu_percent",
-            options=[ft.DropdownOption(key=key, text=spec[0]) for key, spec in self.SERIES.items()],
-            on_select=self.select_series,
-        )
-        self.plot = SeriesPlot()
-        self.chart = ft.Column(
-            [self.series, self.plot.content],
-            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        self.readings = ft.ResponsiveRow(
+            spacing=12,
+            run_spacing=12,
+            breakpoints={"xs": 0, "sm": 300, "md": 670},
             visible=False,
         )
-        self.metrics = ft.Column(visible=False)
-        self.content = ft.Column(
-            [self.status, self.readings, self.chart, self.metrics],
+        self.reading_values: list[tuple[ft.Text, ft.Text]] = []
+        for label in ("Загрузка ЦП", "ОЗУ", "Температура", "Сеть"):
+            value = ft.Text(
+                size=17,
+                weight=ft.FontWeight.W_700,
+                max_lines=1,
+                overflow=ft.TextOverflow.ELLIPSIS,
+            )
+            unit = ft.Text(color=MUTED, size=12)
+            self.reading_values.append((value, unit))
+            self.readings.controls.append(
+                ft.Container(
+                    ft.Column([ft.Text(label, color=MUTED, size=13), value, unit], spacing=2),
+                    col={"xs": 12, "sm": 6, "md": 3},
+                    height=95,
+                    border_radius=CONTROL_RADIUS,
+                    padding=12,
+                )
+            )
+        self.connections = ft.ResponsiveRow(spacing=16, run_spacing=14)
+        self.system = ft.Column(
+            [section_title("Система и сеть"), self.connections],
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             spacing=14,
+            visible=False,
+        )
+        self.plots = {
+            key: SeriesPlot(label, color=color) for key, (label, _, _, color) in self.SERIES.items()
+        }
+        self.chart_grid = ft.ResponsiveRow(
+            [plot.content for plot in self.plots.values()], spacing=12, run_spacing=12
+        )
+        self.chart = ft.Column(
+            [section_title("Графики"), self.chart_grid],
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            spacing=12,
+            visible=False,
+        )
+        self.metrics = ft.Column(horizontal_alignment=ft.CrossAxisAlignment.STRETCH, visible=False)
+        self.content = ft.Column(
+            [self.status, self.readings, self.chart, self.system, self.metrics],
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            spacing=22,
         )
 
     def start(self) -> None:
-        self.task = asyncio.create_task(self.poll())
+        if self.task is None:
+            self.task = asyncio.create_task(self.poll())
 
     def close(self) -> asyncio.Task[None] | None:
         task, self.task = self.task, None
@@ -230,40 +321,50 @@ class TelemetryPanel:
 
     def render(self, sample: SystemTelemetry) -> None:
         ram = "Нет данных"
+        ram_unit = ""
         if sample.ram_used_bytes is not None and sample.ram_total_bytes is not None:
-            ram = f"{sample.ram_used_bytes / MEBIBYTE:.0f} / {sample.ram_total_bytes / MEBIBYTE:.0f} МиБ"
-        link = {True: "Активны", False: "Неактивны", None: "Нет данных"}[sample.network_operational]
-        if sample.interfaces:
-            link = f"{link} · {', '.join(sample.interfaces)}"
+            ram = (
+                f"{sample.ram_used_bytes / MEBIBYTE:.0f} / {sample.ram_total_bytes / MEBIBYTE:.0f}"
+            )
+            ram_unit = "МиБ"
+        network, network_color, network_tint = {
+            True: ("Активна", SUCCESS, SUCCESS_TINT),
+            False: ("Неактивна", ERROR, ERROR_TINT),
+            None: ("Нет данных", MUTED, SUBTLE),
+        }[sample.network_operational]
         self.status.value = f"Обновлено {sample.timestamp.astimezone():%H:%M:%S}"
         self.status.color = MUTED
-        fields = [
-            ("Загрузка ЦП", measured(sample.cpu_percent, "%")),
-            ("ОЗУ", ram),
-            ("Температура", measured(sample.temperature_c, "°C")),
-            ("Сетевые интерфейсы", link),
+        readings = [
+            (measured(sample.cpu_percent, "%"), "", PRIMARY, PRIMARY_TINT),
+            (ram, ram_unit, TEAL, TEAL_TINT),
+            (measured(sample.temperature_c, "°C"), "", AMBER, AMBER_TINT),
+            (network, "", network_color, network_tint),
+        ]
+        connections = [
+            ("Сетевые интерфейсы", ", ".join(sample.interfaces) or "Нет данных"),
             ("Принято с запуска ОС", measured(sample.network_rx_bytes, "МиБ", scale=MEBIBYTE)),
             ("Передано с запуска ОС", measured(sample.network_tx_bytes, "МиБ", scale=MEBIBYTE)),
             ("Режим агента", "Yahboom" if sample.robot == "yahboom" else "Mock Robot"),
             ("Оборудование в RoboLab", "Занято" if sample.hardware_busy else "Свободно"),
             ("Камера", "Настроена" if sample.camera_available else "Не настроена"),
         ]
-        self.readings.controls = [
-            field(label, value, col={"xs": 6, "sm": 4, "lg": 3}) for label, value in fields
+        for card, (value_text, unit_text), (value, unit, color, tint) in zip(
+            self.readings.controls, self.reading_values, readings, strict=True
+        ):
+            value_text.value = value_text.tooltip = value
+            value_text.color = color
+            unit_text.value = unit
+            unit_text.visible = bool(unit)
+            card.bgcolor = tint
+        self.connections.controls = [
+            field(label, value, col={"xs": 6, "sm": 4}) for label, value in connections
         ]
-        self.readings.visible = self.chart.visible = self.metrics.visible = True
+        self.readings.visible = self.chart.visible = self.system.visible = self.metrics.visible = (
+            True
+        )
 
-        metric_options = [
-            ft.DropdownOption(key=f"metric:{name}", text=name) for name in sorted(sample.metrics)
-        ]
-        if [item.key for item in self.series.options[len(self.SERIES) :]] != [
-            item.key for item in metric_options
-        ]:
-            self.series.options = self.series.options[: len(self.SERIES)] + metric_options
-        if self.series.value not in {item.key for item in self.series.options}:
-            self.series.value = "cpu_percent"
         self.metrics.controls = [
-            ft.Text("Метрики скрипта", weight=ft.FontWeight.W_600),
+            section_title("Метрики скрипта"),
             *([ft.Text(str(sample.run_id), color=MUTED, size=12)] if sample.run_id else []),
             (
                 table([(name, scalar(value)) for name, value in sorted(sample.metrics.items())])
@@ -271,34 +372,41 @@ class TelemetryPanel:
                 else ft.Text("Метрик пока нет.", color=MUTED)
             ),
         ]
-        self.render_graph()
+        self.render_graphs(sample.run_id)
 
-    async def select_series(self, event: ft.ControlEvent) -> None:
-        if self.task is not None:
-            self.render_graph()
-            self.chart.update()
-
-    def render_graph(self) -> None:
-        key = self.series.value or "cpu_percent"
-        unit = ""
-        if key in self.SERIES:
-            _, unit, scale = self.SERIES[key]
-            raw = [getattr(sample, key) for sample in self.samples]
-            values = [value / scale if value is not None else None for value in raw]
-        elif self.samples:
-            run_id = self.samples[-1].run_id
-            name = key.removeprefix("metric:")
-            values = [
-                sample.metrics.get(name) if sample.run_id == run_id else None
+    def render_graphs(self, run_id: UUID | None) -> None:
+        for key, (_, unit, scale, _) in self.SERIES.items():
+            points = [
+                (
+                    sample.timestamp,
+                    None if (value := getattr(sample, key)) is None else value / scale,
+                )
                 for sample in self.samples
             ]
-        else:
-            values = []
-        self.plot.set_values(
-            [(sample.timestamp, value) for sample, value in zip(self.samples, values, strict=True)],
-            unit=unit,
-            limits=(0, 100) if key == "cpu_percent" else None,
-        )
+            self.plots[key].set_values(
+                points, unit=unit, limits=(0, 100) if key == "cpu_percent" else None
+            )
+
+        names = {
+            name for sample in self.samples if sample.run_id == run_id for name in sample.metrics
+        }
+        metric_keys = {f"metric:{name}" for name in names}
+        if metric_keys != self.plots.keys() - self.SERIES.keys():
+            for key in self.plots.keys() - self.SERIES.keys() - metric_keys:
+                del self.plots[key]
+            for name in sorted(names):
+                key = f"metric:{name}"
+                if key not in self.plots:
+                    self.plots[key] = SeriesPlot(name, color=TEAL)
+            self.chart_grid.controls = [
+                self.plots[key].content for key in (*self.SERIES, *sorted(metric_keys))
+            ]
+        for name in names:
+            points = [
+                (sample.timestamp, sample.metrics.get(name) if sample.run_id == run_id else None)
+                for sample in self.samples
+            ]
+            self.plots[f"metric:{name}"].set_values(points)
 
 
 class ExperimentsPanel:
@@ -314,15 +422,20 @@ class ExperimentsPanel:
         self.selected: dict[UUID, Experiment] = {}
         self.checkboxes: dict[UUID, ft.Checkbox] = {}
         self.detail_id: UUID | None = None
-        self.loading = ft.ProgressBar(visible=False)
+        self.loading = ft.ProgressBar(visible=False, color=PRIMARY)
         self.notice = ft.Text(visible=False)
-        self.body = ft.Column(horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+        self.body = ft.Column(horizontal_alignment=ft.CrossAxisAlignment.STRETCH, spacing=14)
         self.selection_count = ft.Text(color=MUTED)
-        self.compare_button = ft.FilledButton("Сравнить", on_click=self.compare, disabled=True)
-        self.clear_button = ft.TextButton("Сбросить выбор", on_click=self.clear, disabled=True)
+        self.compare_button = ft.FilledButton(
+            "Сравнить", height=44, on_click=self.compare, disabled=True
+        )
+        self.clear_button = ft.OutlinedButton(
+            "Сбросить выбор", height=44, on_click=self.clear, disabled=True
+        )
         self.content = ft.Column(
             [self.loading, self.notice, self.body],
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            spacing=14,
         )
         self.render_list()
 
@@ -338,7 +451,7 @@ class ExperimentsPanel:
 
     def set_notice(self, message: str, *, error: bool = False) -> None:
         self.notice.value = message
-        self.notice.color = ERROR if error else ACCENT
+        self.notice.color = ERROR if error else SUCCESS
         self.notice.visible = bool(message)
 
     def submit(self, action: Callable[[], Awaitable[None]]) -> None:
@@ -381,70 +494,92 @@ class ExperimentsPanel:
             self.checkboxes[run.id] = checkbox
             rows.append(
                 ft.Container(
-                    bgcolor="#1D2B3B",
-                    border_radius=8,
-                    padding=10,
-                    content=ft.Column(
+                    border=ft.Border.only(bottom=ft.BorderSide(1, LINE)),
+                    padding=ft.Padding.symmetric(vertical=14),
+                    content=ft.ResponsiveRow(
                         [
-                            ft.Text(run.script_name, weight=ft.FontWeight.W_600),
-                            ft.Text(
-                                f"{timestamp(run.started_at)} · {RUN_STATUS[run.status]} · "
-                                f"{run.elapsed_seconds:.1f} с",
-                                size=13,
-                                color=MUTED,
-                            ),
-                            ft.Row(
+                            ft.Column(
                                 [
+                                    section_title(run.script_name),
+                                    ft.Text(
+                                        f"{timestamp(run.started_at)} · {RUN_STATUS[run.status]} · "
+                                        f"{run.elapsed_seconds:.1f} с",
+                                        size=13,
+                                        color=MUTED,
+                                    ),
+                                ],
+                                spacing=5,
+                                col={"xs": 12, "md": 7},
+                            ),
+                            ft.Container(
+                                button_row(
                                     ft.OutlinedButton(
                                         "Открыть",
+                                        height=44,
                                         tooltip=f"Открыть эксперимент «{run.script_name}»",
                                         data=run.id,
                                         on_click=self.open,
                                     ),
                                     checkbox,
-                                ],
-                                wrap=True,
+                                ),
+                                col={"xs": 12, "md": 5},
                             ),
                         ],
-                        spacing=2,
+                        spacing=16,
+                        run_spacing=4,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                 )
             )
         self.body.controls = [
-            ft.Row(
-                [self.compare_button, self.clear_button, self.selection_count],
-                wrap=True,
-            ),
+            self.selection_count,
+            button_row(self.compare_button, self.clear_button),
             *(
-                [ft.ListView(rows, spacing=8, height=min(360, len(rows) * 132))]
+                [ft.Column(rows, spacing=0, horizontal_alignment=ft.CrossAxisAlignment.STRETCH)]
                 if rows
-                else [ft.Text("На этой странице нет экспериментов.", color=MUTED)]
+                else [
+                    ft.Container(
+                        ft.Text("На этой странице нет экспериментов.", color=MUTED),
+                        bgcolor=SUBTLE,
+                        border_radius=CONTROL_RADIUS,
+                        padding=16,
+                    )
+                ]
             ),
-            ft.Row(
-                [
-                    ft.TextButton(
-                        "Предыдущая страница",
-                        data=max(0, self.offset - HISTORY_PAGE),
-                        on_click=self.go_to_page,
-                        disabled=self.offset == 0,
-                    ),
-                    ft.Text(f"Страница {self.offset // HISTORY_PAGE + 1}", color=MUTED),
-                    ft.TextButton(
-                        "Следующая страница",
-                        data=self.offset + HISTORY_PAGE,
-                        on_click=self.go_to_page,
-                        disabled=not self.has_more,
-                    ),
-                    ft.OutlinedButton("Обновить", data=self.offset, on_click=self.go_to_page),
-                ],
-                wrap=True,
+            ft.Text(
+                f"Страница {self.offset // HISTORY_PAGE + 1}",
+                color=MUTED,
+                text_align=ft.TextAlign.CENTER,
+            ),
+            button_row(
+                ft.OutlinedButton(
+                    "Назад",
+                    height=44,
+                    tooltip="Предыдущая страница",
+                    data=max(0, self.offset - HISTORY_PAGE),
+                    on_click=self.go_to_page,
+                    disabled=self.offset == 0,
+                ),
+                ft.OutlinedButton(
+                    "Далее",
+                    height=44,
+                    tooltip="Следующая страница",
+                    data=self.offset + HISTORY_PAGE,
+                    on_click=self.go_to_page,
+                    disabled=not self.has_more,
+                ),
+                ft.OutlinedButton(
+                    "Обновить", height=44, data=self.offset, on_click=self.go_to_page
+                ),
             ),
         ]
         self.update_selection()
 
     def update_selection(self) -> None:
         count = len(self.selected)
-        self.selection_count.value = f"Выбрано {count} из 2"
+        self.selection_count.value = (
+            f"Выбрано {count} из 2" if count else "Выберите два эксперимента"
+        )
         self.compare_button.disabled = count != 2
         self.clear_button.disabled = count == 0
         for run_id, checkbox in self.checkboxes.items():
@@ -504,33 +639,40 @@ class ExperimentsPanel:
             for sample in details.samples
         ]
         self.body.controls = [
-            ft.Row(
-                [
-                    ft.TextButton("Назад к списку", on_click=self.back),
-                    *[
-                        ft.OutlinedButton(
-                            f"Сохранить {format.upper()}", data=format, on_click=self.save
-                        )
-                        for format in ("json", "csv")
-                    ],
+            button_row(
+                ft.TextButton("К списку", height=44, on_click=self.back),
+                *[
+                    ft.OutlinedButton(
+                        format.upper(),
+                        height=44,
+                        tooltip=f"Сохранить {format.upper()}",
+                        data=format,
+                        on_click=self.save,
+                    )
+                    for format in ("json", "csv")
                 ],
-                wrap=True,
             ),
-            ft.Text(run.script_name, size=18, weight=ft.FontWeight.W_600),
+            ft.Text(run.script_name, size=22, weight=ft.FontWeight.W_600, color=TEXT),
             ft.Text(f"{run.script_id} · {run.id}", size=12, color=MUTED, selectable=True),
-            ft.ResponsiveRow(
-                [field(label, value, col={"xs": 6, "md": 4}) for label, value in items],
-                run_spacing=10,
+            ft.Container(
+                ft.ResponsiveRow(
+                    [field(label, value, col={"xs": 6, "md": 4}) for label, value in items],
+                    spacing=14,
+                    run_spacing=14,
+                ),
+                bgcolor=SUBTLE,
+                border_radius=CONTROL_RADIUS,
+                padding=14,
             ),
-            ft.Text("Параметры", weight=ft.FontWeight.W_600),
+            section_title("Параметры"),
             self.mapping(run.parameters),
-            ft.Text("Последние значения метрик", weight=ft.FontWeight.W_600),
+            section_title("Последние значения метрик"),
             self.mapping(run.metrics),
-            ft.Text("График метрик", weight=ft.FontWeight.W_600),
+            section_title("Графики метрик"),
             history_chart(details.samples),
-            ft.Text("Отсчёты", weight=ft.FontWeight.W_600),
+            section_title("Отсчёты"),
             scroll_lines(samples),
-            ft.Text("Журнал эксперимента", weight=ft.FontWeight.W_600),
+            section_title("Журнал эксперимента"),
             scroll_lines(logs),
         ]
 
@@ -554,13 +696,17 @@ class ExperimentsPanel:
         metrics = self.comparison(first.metrics, second.metrics)
         self.set_notice("")
         self.body.controls = [
-            ft.TextButton("Назад к списку", on_click=self.back),
-            ft.Text("Сравнение экспериментов", size=18, weight=ft.FontWeight.W_600),
-            table([("Запуск", "Первый", "Второй"), *fields]),
-            ft.Text("Параметры", weight=ft.FontWeight.W_600),
-            table(parameters) if parameters else ft.Text("Нет записей.", color=MUTED),
-            ft.Text("Последние значения метрик", weight=ft.FontWeight.W_600),
-            table(metrics) if metrics else ft.Text("Нет записей.", color=MUTED),
+            button_row(ft.TextButton("К списку", height=44, on_click=self.back)),
+            ft.Text("Сравнение экспериментов", size=22, weight=ft.FontWeight.W_600, color=TEXT),
+            table(fields, header=("Запуск", "Первый", "Второй")),
+            section_title("Параметры"),
+            table(parameters, header=("Параметр", "Первый", "Второй"))
+            if parameters
+            else ft.Text("Нет записей.", color=MUTED),
+            section_title("Последние значения метрик"),
+            table(metrics, header=("Показатель", "Первый", "Второй"))
+            if metrics
+            else ft.Text("Нет записей.", color=MUTED),
         ]
         self.content.update()
 

@@ -6,22 +6,36 @@ from uuid import UUID
 
 import flet as ft
 
-from client.camera import CameraDialog
+from client.appearance import (
+    AMBER,
+    AMBER_TINT,
+    BACKGROUND,
+    CONTROL_RADIUS,
+    DANGER,
+    ERROR,
+    ERROR_TINT,
+    LINE,
+    MUTED,
+    PRIMARY,
+    PRIMARY_TINT,
+    SUCCESS,
+    SURFACE,
+    TEAL,
+    TEAL_TINT,
+    TEXT,
+    button_row,
+    light_theme,
+)
+from client.camera import CameraPanel
 from client.configuration import ConfigurationStore, ParameterDialog
 from client.connection import RobotConnection, RobotError
 from client.experiments import RUN_STATUS, ExperimentsPanel, TelemetryPanel
 from client.files import FilePanel
+from client.run_journal import RunJournal
 from client.ssh import PoweroffUnconfirmed, SshError, SshSession, SshTarget
 from client.ssh_login import SshLogin, confirm, safe_poweroff
-from common.protocol import LOG_LIMIT, EventFrame, RunState, SafetyState, Script
+from common.protocol import EventFrame, RunState, SafetyState, Script
 
-PANEL = "#202733"
-BACKGROUND = "#171D28"
-RAIL = "#222936"
-ACTIVE = "#075F83"
-MUTED = "#A7B7CB"
-ACCENT = "#70E0CD"
-ERROR = "#FFB4A9"
 HEARTBEAT_PERIOD = 0.7
 LEASE_TIMEOUT = 4
 
@@ -35,6 +49,8 @@ class Dashboard:
         self.ssh_session: SshSession | None = None
         self.ssh_target: SshTarget | None = None
         self.ssh_task: asyncio.Task[None] | None = None
+        self.ssh_monitor: asyncio.Task[None] | None = None
+        self.agent_task: asyncio.Task[None] | None = None
         self.poweroff_pending = False
         self.poweroff_dialog = False
         self.disconnecting = False
@@ -52,7 +68,8 @@ class Dashboard:
         self.page_available = True
         self.scripts: dict[str, Script] = {}
         self.configurations = ConfigurationStore()
-        self.camera: CameraDialog | None = None
+        self.camera: CameraPanel | None = None
+        self.camera_hold: UUID | None = None
         self.camera_picker = ft.FilePicker()
         self.observability: TelemetryPanel | ExperimentsPanel | None = None
         self.files: FilePanel | None = None
@@ -72,70 +89,96 @@ class Dashboard:
             visible=self.ssh_login is not None,
             on_select=self.select_connection,
         )
-        self.connection_button = ft.OutlinedButton("Подключиться", on_click=self.toggle_connection)
-        self.exit_button = ft.IconButton(ft.Icons.LOGOUT, tooltip="Выйти", on_click=self.exit)
+        self.connection_button = ft.FilledButton(
+            "Подключиться",
+            on_click=self.toggle_connection,
+            height=46,
+        )
+        self.exit_button = ft.TextButton("Выйти", on_click=self.exit)
         self.poweroff_button = ft.OutlinedButton(
-            "Выключить Raspberry Pi",
+            "Выключить Pi",
             icon=ft.Icons.POWER_SETTINGS_NEW,
+            height=44,
             on_click=self.request_poweroff,
             visible=False,
         )
         self.connection_status = ft.Text("Нет подключения", color=MUTED)
-        self.camera_button = ft.OutlinedButton("Камера", visible=False, on_click=self.open_camera)
         self.telemetry_button = ft.OutlinedButton(
             "Телеметрия", visible=False, on_click=self.open_telemetry
         )
         self.experiments_button = ft.OutlinedButton(
             "Эксперименты", visible=False, on_click=self.open_experiments
         )
-        self.files_button = ft.OutlinedButton("Файлы", visible=False, on_click=self.open_files)
+        self.files_button = self.action_button(
+            "Файлы",
+            "Открыть домашнюю папку",
+            ft.Icons.FOLDER_OUTLINED,
+            self.open_files,
+            primary=True,
+        )
+        self.agent_button = self.action_button(
+            "Подготовить эксперименты",
+            "RoboLab запустит агент по SSH",
+            ft.Icons.PLAY_ARROW_OUTLINED,
+            self.prepare_agent,
+        )
         self.observability_content = ft.Column(horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
-        self.observability_card = self.card(self.observability_content)
+        self.observability_card = ft.Container(
+            expand=True,
+            alignment=ft.Alignment.TOP_CENTER,
+            content=ft.Column(
+                [self.observability_content],
+                scroll=ft.ScrollMode.AUTO,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                expand=True,
+            ),
+        )
         self.observability_card.visible = False
         self.selector = ft.Dropdown(label="Скрипт", disabled=True, on_select=self.select_script)
-        self.description = ft.Text(color=MUTED)
+        self.description = ft.Text(color=MUTED, size=13)
         self.parameters_button = ft.OutlinedButton(
-            "Параметры", disabled=True, on_click=self.configure
+            "Параметры", height=44, disabled=True, on_click=self.configure
         )
-        self.start_button = ft.FilledButton("Запустить", disabled=True, on_click=self.start)
-        self.stop_button = ft.OutlinedButton("Остановить", disabled=True, on_click=self.stop)
-        self.run_status = ft.Text("Запусков пока нет.", color=MUTED)
+        self.start_button = ft.FilledButton(
+            "Запустить", height=44, disabled=True, on_click=self.start
+        )
+        self.stop_button = ft.OutlinedButton(
+            "Остановить", height=44, disabled=True, on_click=self.stop
+        )
+        self.run_status = ft.Text("Запусков пока нет.", color=MUTED, size=13)
+        self.run_status_box = ft.Container(
+            self.run_status,
+            padding=ft.Padding.symmetric(horizontal=11, vertical=7),
+            border_radius=CONTROL_RADIUS,
+            bgcolor=PRIMARY_TINT,
+        )
         self.emergency_button = ft.FilledButton(
             "Аварийная остановка",
             height=44,
             style=ft.ButtonStyle(
-                bgcolor="#B3261E", color=ft.Colors.WHITE, shape=ft.RoundedRectangleBorder(radius=8)
+                bgcolor=DANGER,
+                color=SURFACE,
+                shape=ft.RoundedRectangleBorder(radius=CONTROL_RADIUS),
             ),
             disabled=True,
             on_click=self.emergency_stop,
         )
         self.reset_button = ft.OutlinedButton(
-            "Снять блокировку", disabled=True, on_click=self.reset_safety
+            "Снять блокировку", height=44, disabled=True, on_click=self.reset_safety
         )
         self.safety_status = ft.Text(color=MUTED)
         self.safety_controls = ft.Column(
-            [
-                self.reset_button,
-                self.safety_status,
-            ],
+            [self.safety_status, button_row(self.reset_button, self.poweroff_button)],
             visible=False,
-            spacing=6,
+            spacing=8,
         )
         self.error = ft.Text(color=ERROR, visible=False)
-        self.empty_log = ft.Text("Сообщения появятся после запуска.", color=MUTED)
-        self.log_gap = ft.Text("Часть предыдущих сообщений пропущена.", color=MUTED, visible=False)
-        self.log = ft.ListView(expand=True, auto_scroll=True, spacing=4)
-        self.log_card = self.card(
-            ft.Text("Журнал", size=17, weight=ft.FontWeight.W_600),
-            self.empty_log,
-            self.log_gap,
-            ft.SelectionArea(content=self.log, expand=True),
-        )
+        self.journal = RunJournal()
 
     def mount(self) -> None:
         self.page.title = "RoboLab"
-        self.page.theme_mode = ft.ThemeMode.DARK
-        self.page.theme = ft.Theme(color_scheme_seed="#24A5DD")
+        self.page.theme_mode = ft.ThemeMode.LIGHT
+        self.page.theme = light_theme()
         self.page.bgcolor = BACKGROUND
         self.page.padding = 0
         self.page.on_connect = self.reconnect_page
@@ -144,122 +187,167 @@ class Dashboard:
         self.page.on_resize = self.resize
         self.page.services.append(self.camera_picker)
 
-        destinations = (
-            ("run", "Запуск", ft.Icons.PLAY_ARROW_OUTLINED, self.show_run),
-            ("camera", "Камера", ft.Icons.CAMERA_ALT_OUTLINED, self.open_camera),
-            ("telemetry", "Телеметрия", ft.Icons.QUERY_STATS, self.open_telemetry),
-            ("experiments", "Эксперименты", ft.Icons.SCIENCE_OUTLINED, self.open_experiments),
-            ("files", "Файлы", ft.Icons.FOLDER_OUTLINED, self.open_files),
+        self.desktop_status = ft.Text(size=15, color=MUTED)
+        self.mobile_status = ft.Text(size=13, color=MUTED)
+        self.desktop_dot = self.status_dot()
+        self.mobile_dot = self.status_dot()
+        self.desktop_identity = ft.Row(
+            [
+                ft.Container(height=29, width=1, bgcolor=LINE, margin=ft.Margin.only(right=4)),
+                self.desktop_dot,
+                ft.Container(self.desktop_status, expand=True),
+            ],
+            spacing=9,
+            expand=True,
         )
-        self.nav = {
-            key: ft.TextButton(
-                label,
-                icon=icon,
-                on_click=on_click,
-                height=48,
-                style=self.nav_style(key == "run"),
-                visible=key == "run",
-            )
-            for key, label, icon, on_click in destinations
-        }
-        self.rail = ft.Container(
-            width=204,
-            bgcolor=RAIL,
-            padding=ft.Padding.symmetric(horizontal=10, vertical=16),
+        self.mobile_identity = ft.Row([self.mobile_dot, self.mobile_status], spacing=8)
+        self.brand = self.heading("RoboLab", 30)
+        self.header = ft.Container(
             content=ft.Column(
                 [
-                    ft.Container(
-                        ft.Text("RoboLab", size=25, weight=ft.FontWeight.BOLD),
-                        padding=ft.Padding.only(left=10, bottom=10),
+                    ft.Row(
+                        [
+                            self.brand,
+                            self.desktop_identity,
+                            self.exit_button,
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        spacing=20,
                     ),
-                    *self.nav.values(),
+                    self.mobile_identity,
                 ],
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                spacing=4,
+                spacing=3,
             ),
+            border=ft.Border.only(bottom=ft.BorderSide(1, LINE)),
         )
-        self.mobile_title = ft.Text("RoboLab", size=21, weight=ft.FontWeight.BOLD)
-        self.header = ft.Container(
-            bgcolor="#1C2431",
-            border=ft.Border.only(bottom=ft.BorderSide(1, "#364150")),
-            padding=ft.Padding.symmetric(horizontal=16, vertical=9),
-            content=ft.Row(
+        self.emergency_strip = ft.Container(
+            self.emergency_button, alignment=ft.Alignment.CENTER_RIGHT, visible=False
+        )
+
+        controls = (
+            ("run", "Работа", ft.Icons.PLAY_ARROW_OUTLINED, self.show_run),
+            ("files", "Файлы", ft.Icons.FOLDER_OUTLINED, self.open_files),
+            ("telemetry", "Телеметрия", ft.Icons.QUERY_STATS, self.open_telemetry),
+            ("experiments", "Эксперименты", ft.Icons.SCIENCE_OUTLINED, self.open_experiments),
+        )
+        self.nav = {
+            key: self.tab(label, icon, click, mobile=False) for key, label, icon, click in controls
+        }
+        self.mobile_nav = {
+            key: self.tab("История" if key == "experiments" else label, icon, click, mobile=True)
+            for key, label, icon, click in controls
+        }
+        self.desktop_navigation = ft.Container(
+            ft.Row(list(self.nav.values()), spacing=0, scroll=ft.ScrollMode.AUTO),
+            border=ft.Border.only(bottom=ft.BorderSide(1, LINE)),
+        )
+        self.mobile_navigation = ft.Container(
+            ft.Row(list(self.mobile_nav.values()), spacing=0),
+            border=ft.Border.only(top=ft.BorderSide(1, LINE)),
+        )
+
+        self.connection_view = ft.Container(
+            alignment=ft.Alignment.TOP_CENTER,
+            content=ft.Column(
                 [
-                    ft.Column([self.mobile_title, self.connection_status], expand=True, spacing=2),
-                    self.emergency_button,
-                    self.exit_button,
+                    self.heading("Подключение к роботу", 32),
+                    self.connection_mode,
+                    *([self.ssh_login.control] if self.ssh_login is not None else []),
+                    self.address,
+                    self.token,
+                    self.connection_button,
                 ],
-                spacing=8,
+                width=520,
+                spacing=13,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
         )
-        self.mobile_tools = ft.Row(
-            [self.camera_button, self.telemetry_button, self.experiments_button, self.files_button],
-            wrap=True,
+        self.workspace_title = self.heading("Работа с роботом", 40)
+        self.workspace_home = ft.Column(
+            [self.workspace_title, self.files_button, self.agent_button],
+            spacing=26,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            visible=False,
+        )
+        self.run_title = self.heading("Работа с роботом", 32)
+        self.run_controls = ft.Column(
+            [
+                self.run_title,
+                self.selector,
+                self.description,
+                button_row(self.parameters_button, self.start_button, self.stop_button),
+                self.run_status_box,
+            ],
             spacing=8,
-            run_spacing=6,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            visible=False,
         )
-        connection_panel = self.card(
-            ft.Text("Подключение", size=17, weight=ft.FontWeight.W_600),
-            self.connection_mode,
-            *([self.ssh_login.control] if self.ssh_login is not None else []),
-            self.address,
-            self.token,
-            self.connection_button,
-            self.poweroff_button,
-            self.mobile_tools,
+        self.camera_slot = ft.Container(content=None, col={"xs": 12, "md": 6}, visible=False)
+        self.journal_slot = ft.Container(
+            self.journal.content,
+            col=12,
+            padding=12,
+            bgcolor=SURFACE,
+            border=ft.Border.all(1, LINE),
+            border_radius=CONTROL_RADIUS,
         )
-        run_panel = self.card(
-            ft.Text("Запуск", size=17, weight=ft.FontWeight.W_600),
-            self.selector,
-            self.description,
-            ft.Row([self.parameters_button, self.start_button, self.stop_button], wrap=True),
-            self.run_status,
-            self.safety_controls,
+        self.monitor_grid = ft.ResponsiveRow(
+            [self.camera_slot, self.journal_slot],
+            spacing=14,
+            run_spacing=10,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+            visible=False,
+        )
+        self.run_body = ft.Container(
+            content=ft.Column(
+                [
+                    self.connection_view,
+                    self.workspace_home,
+                    self.run_controls,
+                    self.monitor_grid,
+                    self.safety_controls,
+                ],
+                spacing=16,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            )
         )
         self.run_view = ft.Container(
             expand=True,
-            padding=14,
             content=ft.Column(
-                [
-                    ft.ResponsiveRow(
-                        [
-                            ft.Container(connection_panel, col={"xs": 12, "md": 6}),
-                            ft.Container(run_panel, col={"xs": 12, "md": 6}),
-                        ],
-                        spacing=12,
-                        run_spacing=12,
-                    ),
-                    self.observability_card,
-                    self.log_card,
-                ],
+                [self.run_body],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 scroll=ft.ScrollMode.AUTO,
-                spacing=12,
             ),
         )
-        self.files_view = ft.Container(expand=True, visible=False)
-        self.files_safety = ft.Text(size=13, color=ERROR, visible=False)
+        self.files_view = ft.Container(
+            expand=True, visible=False, alignment=ft.Alignment.TOP_CENTER
+        )
+        self.error_banner = ft.Container(
+            self.error,
+            bgcolor=ERROR_TINT,
+            border_radius=CONTROL_RADIUS,
+            visible=False,
+            padding=ft.Padding.symmetric(horizontal=13, vertical=9),
+        )
+        self.files_safety = ft.Text(size=14, color=ERROR, visible=False)
         self.layout()
         self.page.add(
             ft.SafeArea(
                 expand=True,
-                content=ft.Row(
+                content=ft.Column(
                     [
-                        self.rail,
-                        ft.Column(
-                            [
-                                self.header,
-                                self.error,
-                                self.files_safety,
-                                self.run_view,
-                                self.files_view,
-                            ],
-                            expand=True,
-                            spacing=0,
-                            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                        ),
+                        self.header,
+                        self.desktop_navigation,
+                        self.emergency_strip,
+                        self.error_banner,
+                        self.files_safety,
+                        self.run_view,
+                        self.observability_card,
+                        self.files_view,
+                        self.mobile_navigation,
                     ],
                     spacing=0,
-                    vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                 ),
             )
         )
@@ -268,39 +356,121 @@ class Dashboard:
             self.page.run_task(self.restore_login)
 
     @staticmethod
-    def nav_style(selected: bool) -> ft.ButtonStyle:
-        return ft.ButtonStyle(
-            alignment=ft.Alignment.CENTER_LEFT,
-            padding=ft.Padding.symmetric(horizontal=11),
-            color="#F1F5FA",
-            bgcolor=ACTIVE if selected else None,
-            shape=ft.RoundedRectangleBorder(radius=7),
+    def heading(text: str, size: int) -> ft.Text:
+        return ft.Text(text, size=size, color=TEXT, weight=ft.FontWeight.W_800)
+
+    @staticmethod
+    def status_dot() -> ft.Container:
+        return ft.Container(width=9, height=9, bgcolor=MUTED, border_radius=5)
+
+    @staticmethod
+    def action_button(
+        title: str,
+        detail: str,
+        icon: ft.IconData,
+        handler: Callable[[ft.ControlEvent], Awaitable[None]],
+        *,
+        primary: bool = False,
+    ) -> ft.Button:
+        color = SURFACE if primary else TEXT
+        return ft.Button(
+            content=ft.Row(
+                [
+                    ft.Icon(icon, size=32, color=color),
+                    ft.Column(
+                        [
+                            ft.Text(title, size=22, color=color, weight=ft.FontWeight.W_700),
+                            ft.Text(detail, size=15, color=color if primary else MUTED),
+                        ],
+                        spacing=3,
+                        expand=True,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                    ),
+                    ft.Icon(ft.Icons.CHEVRON_RIGHT, size=25, color=color),
+                ],
+                spacing=17,
+            ),
+            style=ft.ButtonStyle(
+                bgcolor=PRIMARY if primary else TEAL_TINT,
+                color=color,
+                shape=ft.RoundedRectangleBorder(radius=CONTROL_RADIUS),
+                padding=ft.Padding.symmetric(horizontal=21, vertical=13),
+                elevation=0,
+            ),
+            height=96,
+            on_click=handler,
+            visible=False,
         )
 
     @staticmethod
-    def card(*controls: ft.Control) -> ft.Container:
+    def tab(
+        label: str,
+        icon: ft.IconData,
+        action: Callable[[ft.ControlEvent], Awaitable[None]],
+        *,
+        mobile: bool,
+    ) -> ft.Container:
+        if mobile:
+            content = ft.Column(
+                [
+                    ft.Icon(icon, size=20),
+                    ft.Text(
+                        label,
+                        size=12,
+                        weight=ft.FontWeight.W_600,
+                        max_lines=1,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                    ),
+                ],
+                spacing=2,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                alignment=ft.MainAxisAlignment.CENTER,
+            )
+        else:
+            content = ft.Text(label, size=15, weight=ft.FontWeight.W_700)
         return ft.Container(
-            content=ft.Column(list(controls), spacing=10),
-            padding=16,
-            border_radius=12,
-            bgcolor=PANEL,
+            ft.TextButton(
+                content, tooltip=label, on_click=action, expand=True, height=64 if mobile else 51
+            ),
+            expand=mobile,
         )
 
-    def size_log(self) -> None:
-        stacked = (self.page.width or 0) < 804
-        self.log_card.height = max(230, (self.page.height or 720) - (535 if stacked else 330))
-
     def layout(self) -> None:
-        self.compact = (self.page.width or 0) < 850
-        self.rail.visible = not self.compact
-        self.mobile_title.visible = self.mobile_tools.visible = self.compact
+        width = self.page.width or 1024
+        self.compact = width < 640
+        inset = 16 if self.compact else 34
+        self.header.padding = ft.Padding.symmetric(
+            horizontal=inset, vertical=12 if self.compact else 20
+        )
+        self.desktop_identity.visible = not self.compact
+        self.mobile_identity.visible = self.compact
+        self.brand.size = 24 if self.compact else 30
+        self.desktop_navigation.padding = ft.Padding.symmetric(horizontal=inset)
+        self.run_view.padding = ft.Padding.only(
+            left=inset, right=inset, top=32 if self.compact else 62, bottom=24
+        )
+        self.run_body.width = min(max(width - inset * 2, 1), 1110)
+        self.selector.width = self.run_body.width if self.compact else 380
+        self.connection_view.content.width = min(self.run_body.width, 520)
+        self.connection_mode.width = self.connection_view.content.width
+        self.workspace_title.size = 29 if self.compact else 46
+        self.workspace_home.spacing = 20 if self.compact else 30
+        self.observability_content.width = min(max(width - inset * 2, 1), 1110)
+        self.observability_card.padding = ft.Padding.symmetric(horizontal=inset, vertical=20)
+        self.error_banner.margin = ft.Margin.only(left=inset, right=inset, top=8)
+        self.emergency_strip.padding = ft.Padding.only(right=inset, left=inset, top=8)
+        self.emergency_button.width = max(width - inset * 2, 1) if self.compact else None
+        self.files_view.padding = ft.Padding.symmetric(horizontal=inset, vertical=12)
+        self.files_button.height = self.agent_button.height = 99 if self.compact else 136
+        self.journal.set_compact(self.compact)
+        if self.camera is not None:
+            self.camera.set_compact(self.compact)
         if self.files is not None:
             self.files.set_compact(self.compact)
-        self.size_log()
 
     async def resize(self, event: ft.ControlEvent) -> None:
         self.layout()
-        self.page.update()
+        self.refresh()
 
     async def restore_login(self) -> None:
         login = self.ssh_login
@@ -319,7 +489,7 @@ class Dashboard:
     async def toggle_connection(self, event: ft.ControlEvent) -> None:
         if self.closed or not self.page_available or self.connection_button.disabled:
             return
-        if self.task is not None or self.ssh_task is not None:
+        if self.task is not None or self.ssh_task is not None or self.ssh_session is not None:
             return
         self.set_error("")
         if self.ssh_login is not None and self.connection_mode.value == "ssh":
@@ -342,10 +512,10 @@ class Dashboard:
             target, session = await login.connect()
             if self.closed or not self.page_available:
                 return
-            robot = RobotConnection(session.address, session.token)
             self.ssh_target, self.ssh_session = target, session
+            self.ssh_monitor = asyncio.create_task(self.monitor_ssh(session))
+            self.connection_status.value = "SSH · подключено"
             session = None
-            self.connect_agent(robot)
         except (SshError, ValueError) as exc:
             self.connection_status.value = "Нет подключения"
             self.set_error(str(exc))
@@ -359,14 +529,72 @@ class Dashboard:
                 await session.close()
             self.refresh()
 
+    async def monitor_ssh(self, session: SshSession) -> None:
+        await session.wait_closed()
+        if self.ssh_session is session and not self.poweroff_pending:
+            await self.disconnect()
+            self.connection_status.value = "SSH-соединение закрыто"
+            self.refresh()
+
+    async def prepare_agent(self, event: ft.ControlEvent) -> None:
+        session = self.ssh_session
+        if session is None or session.closed or self.agent_button.disabled:
+            return
+        self.agent_task = asyncio.current_task()
+        self.refresh()
+        try:
+            folder = ft.TextField(
+                label="Папка со скриптом",
+                hint_text="/путь/на/роботе",
+            )
+            accepted = await confirm(
+                self.page,
+                "Подготовить эксперименты",
+                ft.Column(
+                    [
+                        ft.Text("RoboLab сам подготовит и запустит агент по SSH."),
+                        ft.Text(
+                            "Для работы с роботом укажите папку со скриптом и его настройками. "
+                            "Оставьте поле пустым, чтобы использовать готовую конфигурацию."
+                        ),
+                        folder,
+                    ],
+                    tight=True,
+                ),
+                "Подготовить",
+            )
+            if not accepted or self.ssh_session is not session or session.closed:
+                return
+            body = (folder.value or "").strip()
+            self.set_error("")
+            self.connection_status.value = "SSH · подготовка агента…"
+            self.refresh()
+            address, token = await session.prepare_agent(body or None)
+            robot = RobotConnection(address, token)
+            await robot.catalog()
+            if self.ssh_session is session:
+                self.connect_agent(robot)
+        except (RobotError, SshError, ValueError) as exc:
+            if self.ssh_session is session and not session.closed:
+                self.connection_status.value = "SSH · подключено"
+                self.set_error(str(exc))
+        finally:
+            try:
+                if self.robot is None:
+                    await session.close_agent()
+            finally:
+                if self.agent_task is asyncio.current_task():
+                    self.agent_task = None
+                self.refresh()
+
     def connect_agent(self, robot: RobotConnection) -> None:
         self.robot = robot
         self.scripts = {}
         self.selector.options = []
         self.selector.value = None
         self.current, self.run_id, self.cursor = None, None, 0
-        self.log.controls.clear()
-        self.log_gap.visible = False
+        self.camera_hold = None
+        self.journal.reset()
         self.connection_status.value = "Подключение…"
         self.task = asyncio.create_task(self.watch(robot))
         self.refresh()
@@ -375,11 +603,14 @@ class Dashboard:
         self.disconnecting = True
         task, self.task = self.task, None
         ssh_task, self.ssh_task = self.ssh_task, None
+        agent_task, self.agent_task = self.agent_task, None
+        monitor, self.ssh_monitor = self.ssh_monitor, None
         session, self.ssh_session, self.ssh_target = self.ssh_session, None, None
         self.drop_lease()
         self.robot = None
         self.connected = False
         self.safety = None
+        self.camera_hold = None
         self.token.value = ""
         if self.ssh_login is not None:
             self.ssh_login.password.value = ""
@@ -387,13 +618,17 @@ class Dashboard:
         self.connection_status.value = "Отключено"
         observability_task = self.close_observability()
         files_task = self.close_files()
-        self.close_camera()
-        for pending in (task, ssh_task):
-            if pending is not None:
-                pending.cancel()
+        camera_task = self.close_camera()
+        tasks = [
+            pending
+            for pending in (task, ssh_task, agent_task, monitor)
+            if pending is not None and pending is not asyncio.current_task()
+        ]
+        for pending in tasks:
+            pending.cancel()
         self.refresh()
         try:
-            for pending in (task, ssh_task, observability_task, files_task):
+            for pending in (*tasks, observability_task, files_task, camera_task):
                 if pending is not None:
                     with suppress(asyncio.CancelledError):
                         await pending
@@ -415,7 +650,7 @@ class Dashboard:
                         self.close_camera()
                     if not robot.observability_available:
                         self.close_observability()
-                    if not robot.files_available:
+                    if self.ssh_session is None and not robot.files_available:
                         self.close_files()
                     self.scripts = {script.id: script for script in scripts}
                     self.selector.options = [
@@ -437,17 +672,23 @@ class Dashboard:
                 except RobotError as exc:
                     self.connected = False
                     self.close_observability()
-                    self.close_files()
+                    if self.ssh_session is None:
+                        self.close_files()
                     self.close_camera()
                     if robot.kind == "yahboom":
                         self.drop_lease()
                         self.safety = None
+                        self.camera_hold = None
                     if self.ssh_session is not None and self.ssh_session.closed:
                         self.connection_status.value = "SSH-соединение закрыто"
                         self.set_error("Подключитесь заново.")
                         return
-                    if not exc.retryable:
-                        self.connection_status.value = "Нет подключения"
+                    if not exc.retryable or (
+                        self.ssh_session is not None and self.ssh_session.manages_agent
+                    ):
+                        self.connection_status.value = (
+                            "SSH · подключено" if self.ssh_session else "Нет подключения"
+                        )
                         self.set_error(str(exc))
                         return
                     self.connection_status.value = f"{exc} Повтор через {delay} с"
@@ -458,19 +699,27 @@ class Dashboard:
             if robot is self.robot:
                 self.drop_lease()
                 self.robot = None
-                self.task = None
                 self.connected = False
                 self.safety = None
                 self.close_observability()
-                self.close_files()
-                self.close_camera()
-                session, self.ssh_session, self.ssh_target = self.ssh_session, None, None
-                if session is not None:
-                    await session.close()
-                self.refresh()
+                if self.ssh_session is None:
+                    self.close_files()
+                camera_task = self.close_camera()
+                session = self.ssh_session
+                try:
+                    if camera_task is not None:
+                        with suppress(asyncio.CancelledError):
+                            await camera_task
+                    if session is not None:
+                        await session.close_agent()
+                finally:
+                    if self.task is asyncio.current_task():
+                        self.task = None
+                    self.refresh()
 
     def show_frame(self, packet: EventFrame) -> None:
         previous = self.current
+        previous_safety = self.safety
         self.current = packet.run
         self.safety = packet.safety
         run_id = packet.run.id if packet.run else None
@@ -486,26 +735,27 @@ class Dashboard:
             self.drop_lease()
         if run_id != self.run_id:
             self.run_id, self.cursor = run_id, 0
-            self.log.controls.clear()
-            self.log_gap.visible = False
+            self.journal.reset()
+        if run_id == self.camera_hold:
+            self.camera_hold = None
+        starting = packet.run is not None and packet.run.status == "running"
+        if starting:
+            self.journal.record_run(previous, packet.run)
         if packet.gap:
-            self.log_gap.visible = True
+            self.journal.gap.visible = True
         for line in packet.logs:
-            stamp = line.timestamp.astimezone().strftime("%H:%M:%S")
-            self.log.controls.append(
-                ft.Text(
-                    f"{stamp}  {line.level}  {line.source}  {line.message}",
-                    size=13,
-                )
-            )
-            self.cursor = line.sequence
-        if len(self.log.controls) > LOG_LIMIT:
-            del self.log.controls[:-LOG_LIMIT]
+            if line.sequence > self.cursor:
+                self.journal.record_line(line)
+                self.cursor = line.sequence
+        if not starting:
+            self.journal.record_run(previous, packet.run)
+        self.journal.record_safety(previous_safety, packet.safety)
 
     def refresh(self) -> None:
         if self.closed or not self.page_available:
             return
-        watching = self.task is not None or self.ssh_task is not None
+        live_ssh = self.ssh_session is not None and not self.ssh_session.closed
+        watching = self.task is not None or self.ssh_task is not None or live_ssh
         current = self.current
         via_ssh = self.ssh_login is not None and self.connection_mode.value == "ssh"
         busy = current is not None and current.status in ("running", "stopping")
@@ -532,24 +782,47 @@ class Dashboard:
         self.poweroff_button.disabled = bool(
             self.poweroff_pending or self.poweroff_dialog or self.safety_pending or self.pending
         )
-        self.connection_status.color = ACCENT if self.connected else MUTED
-        self.camera_button.visible = bool(
-            self.connected and self.robot is not None and self.robot.camera_available
-        )
-        self.camera_button.disabled = self.camera is not None
+        online = self.connected or live_ssh
+        display_status = self.connection_status.value
+        if display_status == "SSH · подключено":
+            display_status = "Raspberry Pi · SSH подключён"
+        self.desktop_status.value = self.mobile_status.value = display_status
+        self.desktop_dot.bgcolor = self.mobile_dot.bgcolor = SUCCESS if online else MUTED
+        self.refresh_camera(hardware and (busy or self.pending or self.camera_hold is not None))
         self.telemetry_button.visible = self.experiments_button.visible = bool(
             self.connected and self.robot is not None and self.robot.observability_available
         )
         self.telemetry_button.disabled = isinstance(self.observability, TelemetryPanel)
         self.experiments_button.disabled = isinstance(self.observability, ExperimentsPanel)
-        self.files_button.visible = bool(
+        self.files_button.visible = live_ssh or bool(
             self.connected and self.robot is not None and self.robot.files_available
         )
-        self.run_view.visible = not self.files_open
+        self.agent_button.visible = live_ssh and self.task is None and self.robot is None
+        self.agent_button.disabled = (
+            not self.agent_button.visible or self.agent_task is not None or self.disconnecting
+        )
+        self.connection_view.visible = not live_ssh and self.robot is None
+        self.workspace_home.visible = live_ssh and self.robot is None
+        self.run_controls.visible = self.robot is not None
+        self.monitor_grid.visible = self.run_controls.visible
+        if self.run_controls.visible:
+            self.run_view.padding.top = 18 if self.compact else 24
+        else:
+            self.run_view.padding.top = 32 if self.compact else 62
+        self.error_banner.visible = self.error.visible
+        self.run_view.visible = not self.files_open and self.observability is None
         self.files_view.visible = self.files_open
         self.refresh_navigation()
         self.selector.disabled = not self.connected or busy or self.pending or self.poweroff_dialog
         selected = self.scripts.get(self.selector.value or "")
+        compact_run = self.compact and busy and self.camera_slot.visible
+        self.selector.visible = self.description.visible = not compact_run
+        self.run_title.value = (
+            self.scripts[current.script_id].name
+            if compact_run and current is not None and current.script_id in self.scripts
+            else "Работа с роботом"
+        )
+        self.run_title.size = 23 if compact_run else 30 if self.compact else 32
         self.description.value = selected.description if selected else ""
         self.start_button.disabled = (
             self.selector.disabled
@@ -567,6 +840,7 @@ class Dashboard:
         )
         self.safety_controls.visible = hardware
         self.emergency_button.visible = hardware
+        self.emergency_strip.visible = hardware
         self.emergency_button.disabled = not hardware or safety_pending
         self.reset_button.disabled = (
             not hardware
@@ -583,29 +857,48 @@ class Dashboard:
         self.safety_status.color = ERROR if safety and safety.latched else MUTED
         self.files_safety.value = self.safety_status.value
         self.files_safety.visible = bool(self.files_open and safety and safety.latched)
-        self.empty_log.visible = not self.log.controls
         self.run_status.value = self.format_run(current)
+        colors = {
+            "running": (TEAL, TEAL_TINT),
+            "stopping": (AMBER, AMBER_TINT),
+            "stopped": (AMBER, AMBER_TINT),
+            "failed": (ERROR, ERROR_TINT),
+        }
+        self.run_status.color, self.run_status_box.bgcolor = colors.get(
+            current.status if current else "", (MUTED, PRIMARY_TINT)
+        )
         self.page.update()
 
     def refresh_navigation(self) -> None:
+        online = self.connected or (self.ssh_session is not None and not self.ssh_session.closed)
+        self.desktop_navigation.visible = online and not self.compact
+        self.mobile_navigation.visible = online and self.compact
         for name, button in (
-            ("camera", self.camera_button),
             ("telemetry", self.telemetry_button),
             ("experiments", self.experiments_button),
             ("files", self.files_button),
         ):
-            self.nav[name].visible = button.visible
+            self.nav[name].visible = self.mobile_nav[name].visible = button.visible
         selected = "run"
-        if self.camera is not None:
-            selected = "camera"
-        elif self.files_open:
+        if self.files_open:
             selected = "files"
         elif isinstance(self.observability, TelemetryPanel):
             selected = "telemetry"
         elif isinstance(self.observability, ExperimentsPanel):
             selected = "experiments"
-        for name, button in self.nav.items():
-            button.style = self.nav_style(name == selected)
+        for mobile, navigation in ((False, self.nav), (True, self.mobile_nav)):
+            compact_labels = sum(tab.visible for tab in navigation.values()) > 3
+            for name, tab in navigation.items():
+                is_selected = name == selected
+                side = ft.BorderSide(3, PRIMARY if is_selected else BACKGROUND)
+                tab.border = ft.Border.only(top=side) if mobile else ft.Border.only(bottom=side)
+                tab.content.style = ft.ButtonStyle(
+                    padding=ft.Padding.symmetric(horizontal=3 if mobile else 20),
+                    shape=ft.RoundedRectangleBorder(radius=2),
+                    color=PRIMARY if is_selected else MUTED,
+                )
+                if mobile:
+                    tab.content.content.controls[1].size = 10 if compact_labels else 12
 
     @staticmethod
     def format_safety(safety: SafetyState | None) -> str:
@@ -688,6 +981,14 @@ class Dashboard:
                     )
                 except (RuntimeError, TimeoutError) as exc:
                     raise RobotError(str(exc) or "Не удалось прочитать настройки.") from exc
+            camera = self.camera
+            if (
+                script.requires_heartbeat
+                and camera is not None
+                and robot is self.robot
+                and generation == self.lease_generation
+            ):
+                await camera.pause_for_run()
             if robot is not self.robot or generation != self.lease_generation:
                 return
             sent_at = asyncio.get_running_loop().time()
@@ -710,6 +1011,8 @@ class Dashboard:
                 or current.started_at > started.started_at
             ):
                 return
+            if current is None or current.id != started.id:
+                self.camera_hold = started.id
             self.leased_run = started.id
             self.heartbeat_task = asyncio.create_task(
                 self.keep_lease(robot, started.id, started.lease, sent_at + LEASE_TIMEOUT)
@@ -798,6 +1101,7 @@ class Dashboard:
                     tight=True,
                 ),
                 "Выключить",
+                danger=True,
             )
             if not accepted or not active():
                 return
@@ -876,42 +1180,40 @@ class Dashboard:
         self.drop_lease()
         task = self.close_observability()
         files_task = self.close_files()
-        self.close_camera()
-        for pending in (task, files_task):
+        camera_task = self.close_camera()
+        for pending in (task, files_task, camera_task):
             if pending is not None:
                 with suppress(asyncio.CancelledError):
                     await pending
 
     async def close(self, event: ft.ControlEvent) -> None:
         self.closed = True
-        camera_task = self.camera.task if self.camera is not None else None
         await self.disconnect()
-        if camera_task is not None:
-            with suppress(asyncio.CancelledError):
-                await camera_task
 
-    async def open_camera(self, event: ft.ControlEvent) -> None:
+    def refresh_camera(self, hardware_run_active: bool) -> None:
         robot = self.robot
-        if (
-            self.closed
-            or not self.page_available
-            or not self.connected
-            or robot is None
-            or not robot.camera_available
-            or self.camera is not None
-        ):
-            return
-        self.camera = CameraDialog(self.page, robot, self.camera_picker, self.camera_closed)
-        self.camera.show()
-        self.refresh()
+        available = self.connected and robot is not None and robot.camera_available
+        if available and self.camera is None:
+            self.camera = CameraPanel(self.page, robot, self.camera_picker, self.camera_closed)
+            self.camera.set_compact(self.compact)
+            self.camera_slot.content = self.camera.content
+        self.camera_slot.visible = available and self.camera is not None and not self.camera.closed
+        self.journal_slot.col = {"xs": 12, "md": 6} if self.camera_slot.visible else 12
+        if self.camera_slot.visible:
+            self.camera.set_run_active(hardware_run_active)
 
-    def close_camera(self) -> None:
-        if self.camera is not None:
-            self.camera.close(update=self.page_available and not self.closed)
+    def close_camera(self) -> asyncio.Task[None] | None:
+        camera = self.camera
+        if camera is None:
+            return None
+        task = camera.task
+        camera.close(update=self.page_available and not self.closed)
+        return task
 
-    def camera_closed(self, camera: CameraDialog) -> None:
+    def camera_closed(self, camera: CameraPanel) -> None:
         if self.camera is camera:
             self.camera = None
+            self.camera_slot.content = None
             self.refresh()
 
     def observability_robot(self) -> RobotConnection | None:
@@ -981,20 +1283,20 @@ class Dashboard:
                 await task
 
     async def open_files(self, event: ft.ControlEvent) -> None:
-        robot = self.robot
-        if (
-            self.closed
-            or not self.page_available
-            or not self.connected
-            or robot is None
-            or not robot.files_available
-        ):
+        if self.closed or not self.page_available:
+            return
+        session, robot = self.ssh_session, self.robot
+        if session is not None and not session.closed:
+            files = session.files
+        elif self.connected and robot is not None and robot.files_available:
+            files = robot
+        else:
             return
         self.close_observability()
         self.files_open = True
         if self.files is None:
             self.files = FilePanel(
-                self.page, robot, self.camera_picker, self.show_run, self.compact
+                self.page, files, self.camera_picker, self.show_run, self.compact
             )
             self.files_view.content = self.files.content
             self.refresh()

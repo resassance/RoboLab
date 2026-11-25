@@ -4,6 +4,18 @@ import shlex
 import flet as ft
 from pydantic import TypeAdapter
 
+from client.appearance import (
+    CONTROL_RADIUS,
+    ERROR,
+    ERROR_TINT,
+    MUTED,
+    SUCCESS,
+    SUCCESS_TINT,
+    TEAL,
+    TEAL_TINT,
+    TEXT,
+    button_row,
+)
 from common.parameters import Parameter, Value
 from common.protocol import Script
 
@@ -61,19 +73,33 @@ class ParameterDialog:
             max_lines=4,
             text_style=ft.TextStyle(font_family="monospace"),
         )
-        self.error = ft.Text(color="#FFB4A9", visible=False)
+        self.error = ft.Text(color=ERROR, visible=False)
+        self.error_notice = ft.Container(
+            self.error, padding=10, bgcolor=ERROR_TINT, border_radius=CONTROL_RADIUS, visible=False
+        )
         self.preset_name = ft.TextField(label="Название пресета", max_length=60)
-        self.preset_buttons = ft.Row(wrap=True)
+        self.preset_buttons = ft.Column(
+            spacing=6, horizontal_alignment=ft.CrossAxisAlignment.STRETCH
+        )
         self.presets = ft.Column(
             [
-                ft.Text("Пресеты", weight=ft.FontWeight.W_600),
+                ft.Text("Пресеты", weight=ft.FontWeight.W_600, color=TEAL),
                 self.preset_buttons,
             ],
             visible=False,
         )
-        self.saved = ft.Text("Пресет сохранён.", color="#70E0CD", visible=False)
-        self.save_button = ft.OutlinedButton("Сохранить пресет", on_click=self.save_preset)
-        self.apply_button = ft.FilledButton("Применить", on_click=self.apply)
+        self.saved = ft.Text("Пресет сохранён.", color=SUCCESS, visible=False)
+        self.saved_notice = ft.Container(
+            self.saved,
+            padding=10,
+            bgcolor=SUCCESS_TINT,
+            border_radius=CONTROL_RADIUS,
+            visible=False,
+        )
+        self.save_button = ft.OutlinedButton(
+            "Сохранить пресет", height=44, on_click=self.save_preset
+        )
+        self.apply_button = ft.FilledButton("Применить", height=44, on_click=self.apply)
         self.saving = False
         self.dialog: ft.AlertDialog
         self.set_preset_options()
@@ -84,12 +110,14 @@ class ParameterDialog:
 
         for parameter in self.script.parameters:
             if parameter.group not in groups:
-                group = ft.Column([ft.Text(parameter.group, weight=ft.FontWeight.W_600)], spacing=8)
+                group = ft.Column(
+                    [ft.Text(parameter.group, weight=ft.FontWeight.W_600, color=TEXT)], spacing=8
+                )
                 groups[parameter.group] = group
                 controls.append(group)
             control = self.create_input(parameter)
             field = ft.Column(
-                [control, ft.Text(parameter.description, size=12, color="#A7B7CB")],
+                [control, ft.Text(parameter.description, size=12, color=MUTED)],
                 spacing=3,
             )
             self.inputs[parameter.key] = control
@@ -98,26 +126,31 @@ class ParameterDialog:
 
         controls.extend(
             [
-                self.preview,
-                self.error,
+                ft.Container(
+                    self.preview, padding=10, bgcolor=TEAL_TINT, border_radius=CONTROL_RADIUS
+                ),
+                self.error_notice,
                 self.preset_name,
                 self.save_button,
-                self.saved,
+                self.saved_notice,
             ]
         )
         self.dialog = ft.AlertDialog(
             modal=True,
             title=ft.Text(f"Параметры · {self.script.name}"),
             content=ft.Container(
-                width=430,
+                width=min(460, max(210, (self.page.width or 520) - 88)),
                 content=ft.Column(
                     controls, spacing=12, horizontal_alignment=ft.CrossAxisAlignment.STRETCH
                 ),
             ),
             scrollable=True,
+            inset_padding=ft.Padding.symmetric(horizontal=20, vertical=18),
             actions=[
-                ft.TextButton("Отмена", on_click=self.cancel),
-                self.apply_button,
+                button_row(
+                    ft.OutlinedButton("Отмена", height=44, on_click=self.cancel),
+                    self.apply_button,
+                )
             ],
         )
         self.fill(self.initial)
@@ -197,17 +230,22 @@ class ParameterDialog:
 
     def set_error(self, message: str) -> None:
         self.error.value = message
-        self.error.visible = bool(message)
+        self.error.visible = self.error_notice.visible = bool(message)
 
     def set_preset_options(self) -> None:
         self.preset_buttons.controls = [
-            ft.OutlinedButton(name, data=name, on_click=self.use_preset)
+            ft.OutlinedButton(
+                ft.Text(name, text_align=ft.TextAlign.CENTER),
+                data=name,
+                min_height=44,
+                on_click=self.use_preset,
+            )
             for name in sorted(self.preset_names)
         ]
         self.presets.visible = bool(self.preset_buttons.controls)
 
     async def changed(self, event: ft.ControlEvent) -> None:
-        self.saved.visible = False
+        self.saved.visible = self.saved_notice.visible = False
         self.update_preview()
         self.page.update()
 
@@ -248,7 +286,7 @@ class ParameterDialog:
     async def save_preset(self, event: ft.ControlEvent) -> None:
         if self.save_button.disabled:
             return
-        self.saved.visible = False
+        self.saved.visible = self.saved_notice.visible = False
         name = (self.preset_name.value or "").strip()
         if not name or len(name) > 60 or not name.isprintable():
             self.set_error("Введите название пресета, до 60 печатных символов.")
@@ -257,7 +295,7 @@ class ParameterDialog:
         if await self.save(f"{self.key}.preset.{name}", self.values()):
             self.preset_names.add(name)
             self.set_preset_options()
-            self.saved.visible = True
+            self.saved.visible = self.saved_notice.visible = True
             self.page.update()
 
     async def apply(self, event: ft.ControlEvent) -> None:
