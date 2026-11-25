@@ -56,6 +56,28 @@ class SftpFiles:
                         names.append(name)
         return sorted(names, key=lambda name: (name.casefold(), name))
 
+    async def create_folder(
+        self, root: str, path: tuple[str, ...], name: str, *, exist_ok: bool = False
+    ) -> None:
+        if not valid_name(name):
+            raise RobotError("Недопустимое имя папки.", retryable=False)
+        async with self.open(15, "Не удалось создать папку по SFTP.") as sftp:
+            folder = await self.folder(sftp, root, path)
+            destination = posixpath.join(folder, name.encode("utf-8"))
+            try:
+                await sftp.mkdir(destination, asyncssh.SFTPAttrs(permissions=0o700))
+            except asyncssh.SFTPError as exc:
+                try:
+                    existing = await sftp.lstat(destination)
+                except MISSING:
+                    raise exc from None
+                if exist_ok and existing.type == asyncssh.FILEXFER_TYPE_DIRECTORY:
+                    await self.folder(sftp, root, (*path, name))
+                    return
+                raise RobotError(
+                    "Здесь уже есть файл или папка с таким именем.", retryable=False
+                ) from exc
+
     @staticmethod
     async def check_destination(sftp: asyncssh.SFTPClient, file: bytes) -> None:
         try:

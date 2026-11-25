@@ -18,7 +18,13 @@ if __name__ == "__main__":
 """
 
 
-def stage_client(root: Path, destination: Path, *, platform: str = "linux") -> str:
+def stage_client(
+    root: Path,
+    destination: Path,
+    *,
+    platform: str = "linux",
+    dropzone_wheel: Path | None = None,
+) -> str:
     with (root / "pyproject.toml").open("rb") as stream:
         project = tomllib.load(stream)["project"]
     version = project["version"]
@@ -27,6 +33,8 @@ def stage_client(root: Path, destination: Path, *, platform: str = "linux") -> s
         dependency.replace("flet[cli]", "flet")
         for dependency in project["optional-dependencies"]["release"]
     ]
+    if dropzone_wheel is not None and platform in {"linux", "windows"}:
+        dependencies.append(f"robolab-dropzone @ {dropzone_wheel.resolve().as_uri()}")
     paths = subprocess.check_output(
         ["git", "ls-files", "-z", "--", "client/*.py", "common/*.py"], cwd=root
     ).decode("utf-8")
@@ -91,7 +99,29 @@ def build_client(platform: str, output: Path, build_number: int) -> Path:
         work = Path(temp)
         app = work / "app"
         bundle = work / "bundle"
-        version = stage_client(ROOT, app, platform=platform)
+        dropzone_wheel = None
+        if platform in {"linux", "windows"}:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "wheel",
+                    "--no-deps",
+                    "--wheel-dir",
+                    str(work),
+                    str(ROOT / "extensions" / "dropzone"),
+                ],
+                check=True,
+            )
+            (dropzone_wheel,) = work.glob("robolab_dropzone-*.whl")
+        version = stage_client(ROOT, app, platform=platform, dropzone_wheel=dropzone_wheel)
+        if __package__:
+            from .agent_dependencies import bundle_agent_dependencies
+        else:
+            from agent_dependencies import bundle_agent_dependencies
+
+        bundle_agent_dependencies(app / "client" / "robolab-agent-dependencies.zip")
         command = [
             sys.executable,
             "-m",

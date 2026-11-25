@@ -1,11 +1,14 @@
 import asyncio
 import os
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import asyncssh
+import flet as ft
 import pytest
 
 from client.connection import RobotError
+from client.files import FilePanel
 from client.sftp_files import SftpFiles
 
 
@@ -148,3 +151,62 @@ def test_upload_handles_competing_writers_without_replacing_destination(tmp_path
             assert not list(tmp_path.glob(".robolab-upload-*"))
 
     asyncio.run(check())
+
+
+def test_create_folder_inside_selected_sftp_path(tmp_path):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    (parent / "taken").write_bytes(b"old")
+
+    async def check():
+        async with sftp_files(tmp_path) as files:
+            (root,) = (await files.file_storage()).roots
+            await files.create_folder(root, ("parent",), "Новая папка")
+            assert await files.file_folders(root, ("parent",)) == ["Новая папка"]
+            with pytest.raises(RobotError, match="уже есть"):
+                await files.create_folder(root, ("parent",), "taken")
+            with pytest.raises(RobotError):
+                await files.create_folder(root, ("parent",), "..")
+
+    asyncio.run(check())
+    assert (parent / "taken").read_bytes() == b"old"
+
+
+def test_dropped_files_and_folders_are_sent_to_open_directory(tmp_path, monkeypatch):
+    home = tmp_path / "remote"
+    target = home / "experiment"
+    target.mkdir(parents=True)
+    (target / "taken.txt").write_bytes(b"existing")
+    folder = tmp_path / "Запуск"
+    (folder / "empty").mkdir(parents=True)
+    (folder / "trace.csv").write_bytes(b"1,2")
+    outside = tmp_path / "taken.txt"
+    outside.write_bytes(b"new")
+    other = tmp_path / "readme.txt"
+    other.write_bytes(b"notes")
+
+    async def check():
+        async with sftp_files(home) as files:
+            page = SimpleNamespace(web=False, platform=ft.PagePlatform.LINUX)
+            panel = FilePanel(page, files, None, None, compact=False)
+            panel.refresh = panel.render
+            monkeypatch.setattr(panel.progress_row, "update", lambda: None)
+            await panel.load_storage()
+            await panel.load_folders(panel.root, ("experiment",))
+            await panel.drop_paths([str(folder), str(outside), str(other)])
+            await panel.task
+            assert panel.folders == ["Запуск"]
+            assert "taken.txt" in panel.notice.value
+
+            (folder / "trace.csv").write_bytes(b"new")
+            (folder / "z_retry.txt").write_bytes(b"retry")
+            await panel.drop_paths([str(folder)])
+            await panel.task
+            assert "trace.csv" in panel.notice.value
+
+    asyncio.run(check())
+    assert (target / "Запуск" / "empty").is_dir()
+    assert (target / "Запуск" / "z_retry.txt").read_bytes() == b"retry"
+    assert (target / "Запуск" / "trace.csv").read_bytes() == b"1,2"
+    assert (target / "readme.txt").read_bytes() == b"notes"
+    assert (target / "taken.txt").read_bytes() == b"existing"

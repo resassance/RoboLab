@@ -5,8 +5,9 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import flet as ft
+import pytest
 
-from client.files import FilePanel
+from client.files import FilePanel, open_file
 from common.protocol import FileStorage
 
 
@@ -68,3 +69,15 @@ def test_android_picker_cache_is_released_without_touching_other_files(tmp_path,
     assert not Path(accepted.path).parent.exists()
     panel.close()
     assert Path(external.path).read_bytes() == b"c"
+
+
+def test_dropped_file_read_rejects_same_size_replacement(tmp_path):
+    file = tmp_path / "report.csv"
+    file.write_bytes(b"original")
+    info = file.stat()
+    replacement = tmp_path / "new.csv"
+    replacement.write_bytes(b"replaced")
+    replacement.replace(file)
+
+    with pytest.raises(OSError):
+        open_file(str(file), info.st_size, (info.st_dev, info.st_ino))

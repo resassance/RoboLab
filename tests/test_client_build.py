@@ -35,7 +35,10 @@ def test_release_staging_includes_only_tracked_sources(tmp_path, platform, pytho
     (repository / "agent" / "untracked.py").write_text("private\n", encoding="utf-8")
     destination = tmp_path / "package"
 
-    version = stage_client(repository, destination, platform=platform)
+    dropzone = tmp_path / "drop support" / "robolab_dropzone-0.1.0-py3-none-any.whl"
+    dropzone.parent.mkdir()
+    dropzone.touch()
+    version = stage_client(repository, destination, platform=platform, dropzone_wheel=dropzone)
 
     assert {
         p.relative_to(destination).as_posix() for p in destination.rglob("*") if p.is_file()
@@ -65,6 +68,10 @@ def test_release_staging_includes_only_tracked_sources(tmp_path, platform, pytho
     assert project["project"]["version"] == version
     assert project["project"]["requires-python"] == python_requirement
     dependencies = project["project"]["dependencies"]
+    if platform in ("linux", "windows"):
+        assert f"robolab-dropzone @ {dropzone.as_uri()}" in dependencies
+    else:
+        assert not any(name.startswith("robolab-dropzone") for name in dependencies)
     assert all(
         any(dependency.startswith(f"{name}==") for dependency in dependencies)
         for name in (

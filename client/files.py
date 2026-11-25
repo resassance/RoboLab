@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 import asyncio
 import os
 import stat
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import aclosing, suppress
 from pathlib import Path
 from time import monotonic
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 import flet as ft
@@ -27,7 +30,16 @@ from client.appearance import (
 )
 from client.connection import RobotConnection, RobotError
 from client.sftp_files import SftpFiles
-from common.protocol import FileStorage
+from common.file_paths import valid_name
+from common.protocol import FileReceipt, FileStorage
+
+if TYPE_CHECKING:
+    from robolab_dropzone import DropEvent
+
+try:
+    from robolab_dropzone import DropZone
+except ImportError:
+    DropZone = None
 
 BLOCK = 128 * 1024
 
@@ -40,12 +52,18 @@ def file_size(size: int) -> str:
     return f"{size / 1024**2:.1f} МБ"
 
 
-def open_file(path: str, expected_size: int) -> int:
+def open_file(path: str, expected_size: int, identity: tuple[int, int] | None = None) -> int:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    if identity is not None:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size != expected_size:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size != expected_size
+            or (identity is not None and (info.st_dev, info.st_ino) != identity)
+        ):
             raise OSError("The selected file changed.")
     except OSError:
         os.close(fd)
@@ -53,7 +71,9 @@ def open_file(path: str, expected_size: int) -> int:
     return fd
 
 
-async def file_chunks(file: ft.FilePickerFile) -> AsyncIterator[bytes]:
+async def file_chunks(
+    file: ft.FilePickerFile, identity: tuple[int, int] | None = None
+) -> AsyncIterator[bytes]:
     if file.bytes is not None:
         if len(file.bytes) != file.size:
             raise OSError("The selected file changed.")
@@ -62,7 +82,7 @@ async def file_chunks(file: ft.FilePickerFile) -> AsyncIterator[bytes]:
         return
     if file.path is None:
         raise OSError("The selected file is unavailable.")
-    fd = open_file(file.path, file.size)
+    fd = open_file(file.path, file.size, identity)
     try:
         remaining = file.size
         while remaining:
@@ -88,6 +108,26 @@ async def file_chunks(file: ft.FilePickerFile) -> AsyncIterator[bytes]:
         os.close(fd)
 
 
+def drop_entries(source: Path, max_bytes: int) -> Iterator[tuple[tuple[str, ...], os.stat_result]]:
+    pending = [(source, ())]
+    while pending:
+        local, parent = pending.pop()
+        name = local.name
+        if not valid_name(name):
+            raise RobotError("Недопустимое имя файла или папки.", retryable=False)
+        info = local.lstat()
+        destination = (*parent, name)
+        if getattr(info, "st_reparse_tag", None) == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", -1):
+            raise RobotError("Нельзя отправить ссылку на папку.", retryable=False)
+        if stat.S_ISDIR(info.st_mode):
+            pending.extend((child, destination) for child in sorted(local.iterdir(), reverse=True))
+        elif not stat.S_ISREG(info.st_mode):
+            raise RobotError(f"«{name}» — ссылка или специальный файл.", retryable=False)
+        elif info.st_size > max_bytes:
+            raise RobotError(f"Файл «{name}» превышает лимит {file_size(max_bytes)}.")
+        yield destination, info
+
+
 class FilePanel:
     def __init__(
         self,
@@ -108,6 +148,7 @@ class FilePanel:
         self.task: asyncio.Task[None] | None = None
         self.closed = False
         self.picking = False
+        self.creating_folder = False
         self.sending = False
         self.sent = 0
         self.compact = compact
@@ -163,33 +204,49 @@ class FilePanel:
             border_radius=CONTROL_RADIUS,
             padding=12,
         )
+        self.new_folder = ft.OutlinedButton(
+            "Новая папка",
+            icon=ft.Icons.CREATE_NEW_FOLDER_OUTLINED,
+            height=44,
+            on_click=self.show_new_folder,
+        )
+        self.native_drop = (
+            DropZone is not None
+            and not page.web
+            and page.platform in (ft.PagePlatform.LINUX, ft.PagePlatform.WINDOWS)
+        )
+        self.drop_hint = ft.Text(
+            "Перетащите файлы или папки сюда", color=MUTED, size=13, visible=False
+        )
         self.tray = ft.Container(
             border=ft.Border.only(top=ft.BorderSide(1, LINE)),
             padding=ft.Padding.only(top=16, bottom=4),
             content=ft.Column(
-                [self.selection, self.progress_row, self.feedback, self.actions],
+                [self.drop_hint, self.selection, self.progress_row, self.feedback, self.actions],
                 spacing=12,
                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
         )
-        self.content = ft.Container(
-            expand=True,
-            content=ft.Column(
-                [
-                    ft.Row([self.back, self.heading, self.reload], spacing=4),
-                    ft.Container(
-                        bgcolor=TEAL_TINT,
-                        border_radius=CONTROL_RADIUS,
-                        padding=ft.Padding.symmetric(horizontal=6, vertical=2),
-                        content=self.breadcrumb,
-                    ),
-                    self.folders_view,
-                    self.tray,
-                ],
-                spacing=12,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-            ),
+        layout = ft.Column(
+            [
+                ft.Row([self.back, self.heading, self.reload], spacing=4),
+                ft.Container(
+                    bgcolor=TEAL_TINT,
+                    border_radius=CONTROL_RADIUS,
+                    padding=ft.Padding.symmetric(horizontal=6, vertical=2),
+                    content=self.breadcrumb,
+                ),
+                self.new_folder,
+                self.folders_view,
+                self.tray,
+            ],
+            spacing=12,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         )
+        self.drop_zone = (
+            DropZone(content=layout, on_drop=self.receive_drop) if self.native_drop else None
+        )
+        self.content = ft.Container(expand=True, content=self.drop_zone or layout)
         self.render()
 
     def set_compact(self, compact: bool) -> None:
@@ -245,6 +302,143 @@ class FilePanel:
     async def navigate(self, event: ft.ControlEvent) -> None:
         root, path = event.control.data
         self.request(lambda: self.load_folders(root, path))
+
+    async def show_new_folder(self, event: ft.ControlEvent) -> None:
+        if (
+            self.closed
+            or self.task is not None
+            or self.picking
+            or self.creating_folder
+            or self.root is None
+        ):
+            return
+        root, path = self.root, self.path
+        self.creating_folder = True
+        self.refresh()
+
+        async def dismiss(event: ft.ControlEvent) -> None:
+            self.creating_folder = False
+            self.refresh()
+
+        async def cancel(event: ft.ControlEvent) -> None:
+            self.page.pop_dialog()
+
+        async def create(event: ft.ControlEvent) -> None:
+            name = (field.value or "").strip()
+            if not valid_name(name):
+                field.error_text = "Введите допустимое имя папки."
+                field.update()
+                return
+            self.page.pop_dialog()
+            self.request(lambda: self.create_folder(root, path, name))
+
+        field = ft.TextField(label="Имя папки", autofocus=True, max_length=255, on_submit=create)
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                on_dismiss=dismiss,
+                title=ft.Text("Новая папка"),
+                content=field,
+                actions=[
+                    ft.TextButton("Отмена", on_click=cancel),
+                    ft.FilledButton("Создать", on_click=create),
+                ],
+            )
+        )
+
+    async def create_folder(self, root: str, path: tuple[str, ...], name: str) -> None:
+        await self.robot.create_folder(root, path, name)
+        await self.load_folders(root, path)
+        self.message(f"Создана папка «{name}».")
+
+    async def receive_drop(self, event: DropEvent) -> None:
+        await self.drop_paths(event.paths)
+
+    async def drop_paths(self, paths: list[str]) -> None:
+        if (
+            self.closed
+            or self.task is not None
+            or self.picking
+            or self.creating_folder
+            or not paths
+        ):
+            return
+        if self.root is None or self.storage is None:
+            self.message("Выберите папку назначения перед отправкой.", warning=True)
+            self.refresh()
+            return
+        root, path, max_bytes = self.root, self.path, self.storage.max_upload_bytes
+        self.clear_file()
+        self.sending, self.sent = True, 0
+        self.request(lambda: self.upload_dropped(root, path, paths, max_bytes))
+
+    async def upload_dropped(
+        self, root: str, path: tuple[str, ...], paths: list[str], max_bytes: int
+    ) -> None:
+        copied = folders = 0
+        failures = []
+        try:
+            for local in paths:
+                source = Path(local)
+                try:
+                    if not source.is_absolute():
+                        raise RobotError("Путь к файлу недоступен.", retryable=False)
+                    entries = await asyncio.to_thread(lambda: list(drop_entries(source, max_bytes)))
+                except OSError:
+                    failures.append(f"«{source.name}» — не удалось прочитать.")
+                    continue
+                except RobotError as exc:
+                    failures.append(f"«{source.name}» — {exc}")
+                    continue
+
+                blocked = set()
+                for parts, info in entries:
+                    name, relative_parent = parts[-1], parts[:-1]
+                    directory = stat.S_ISDIR(info.st_mode)
+                    if relative_parent in blocked:
+                        if directory:
+                            blocked.add(parts)
+                        continue
+                    parent = (*path, *relative_parent)
+                    try:
+                        if directory:
+                            await self.robot.create_folder(root, parent, name, exist_ok=True)
+                            if parent == path:
+                                self.folders = sorted(
+                                    {*self.folders, name},
+                                    key=lambda value: (value.casefold(), value),
+                                )
+                            folders += 1
+                        else:
+                            file = ft.FilePickerFile(
+                                id=0,
+                                name=name,
+                                size=info.st_size,
+                                path=str(source.joinpath(*parts[1:])),
+                            )
+                            self.file, self.sent = file, 0
+                            self.refresh()
+                            await self.transfer(file, root, parent, (info.st_dev, info.st_ino))
+                            self.clear_file()
+                            copied += 1
+                    except (OSError, RobotError) as exc:
+                        description = (
+                            str(exc) if isinstance(exc, RobotError) else "не удалось прочитать."
+                        )
+                        failures.append(f"«{name}» — {description}")
+                        if directory:
+                            blocked.add(parts)
+        except asyncio.CancelledError:
+            self.message("Отправка отменена. Проверьте содержимое папки на роботе.", warning=True)
+            raise
+        finally:
+            self.clear_file()
+        summary = f"Файлов отправлено: {copied}. Папок обработано: {folders}."
+        if failures:
+            summary += f" {failures[0]}"
+            if len(failures) > 1:
+                summary += f" Других ошибок: {len(failures) - 1}."
+        self.message(summary, error=bool(failures))
 
     async def pick_file(self, event: ft.ControlEvent) -> None:
         if self.closed or self.picking or self.task is not None or self.storage is None:
@@ -302,12 +496,18 @@ class FilePanel:
                 self.message("Отправка отменена.", warning=True)
                 self.refresh()
 
-    async def upload(self, file: ft.FilePickerFile, root: str, path: tuple[str, ...]) -> None:
+    async def transfer(
+        self,
+        file: ft.FilePickerFile,
+        root: str,
+        path: tuple[str, ...],
+        identity: tuple[int, int] | None = None,
+    ) -> FileReceipt:
         updated = 0.0
 
         async def content() -> AsyncIterator[bytes]:
             nonlocal updated
-            async with aclosing(file_chunks(file)) as source:
+            async with aclosing(file_chunks(file, identity)) as source:
                 async for chunk in source:
                     yield chunk
                     self.sent += len(chunk)
@@ -316,9 +516,12 @@ class FilePanel:
                         updated = now
                         self.update_progress()
 
+        async with aclosing(content()) as source:
+            return await self.robot.upload_file(root, path, file.name, source, file.size)
+
+    async def upload(self, file: ft.FilePickerFile, root: str, path: tuple[str, ...]) -> None:
         try:
-            async with aclosing(content()) as source:
-                receipt = await self.robot.upload_file(root, path, file.name, source, file.size)
+            receipt = await self.transfer(file, root, path)
         except OSError:
             self.message("Не удалось прочитать файл. Выберите его заново.", error=True)
         except asyncio.CancelledError:
@@ -388,6 +591,10 @@ class FilePanel:
         busy = self.task is not None or self.picking
         self.set_compact(self.compact)
         self.reload.disabled = busy
+        self.new_folder.disabled = busy or self.creating_folder or self.root is None
+        self.drop_hint.visible = self.native_drop and self.root is not None and not busy
+        if self.drop_zone is not None:
+            self.drop_zone.accepting = self.drop_hint.visible and not self.creating_folder
         self.breadcrumb.controls = [
             ft.IconButton(
                 ft.Icons.FOLDER_OUTLINED,

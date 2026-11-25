@@ -181,3 +181,35 @@ def test_disconnect_discards_a_partially_written_file(tmp_path):
     assert received == 2
     assert messages[0]["status"] == 400
     assert list(tmp_path.iterdir()) == []
+
+
+def test_create_folder_requires_token_and_keeps_existing_entries(tmp_path):
+    folder = tmp_path / "Сеанс"
+    folder.mkdir()
+    existing = folder / "Измерения"
+    existing.write_bytes(b"data")
+    (tmp_path / "shortcut").symlink_to(folder, target_is_directory=True)
+    with TestClient(create_app(TOKEN, file_roots={"data": tmp_path})) as api:
+        params = {"root": "data", "path": "Сеанс", "name": "Новая папка"}
+        assert api.post("/files/folders", params=params).status_code == 401
+        assert api.post("/files/folders", params=params, headers=AUTH).status_code == 204
+        assert (
+            api.post(
+                "/files/folders", params={**params, "exist_ok": True}, headers=AUTH
+            ).status_code
+            == 204
+        )
+        for change, status in (
+            ({"exist_ok": True, "name": "Измерения"}, 409),
+            ({"exist_ok": True, "path": "shortcut"}, 404),
+            ({}, 409),
+            ({"name": "Измерения"}, 409),
+            ({"name": ".."}, 400),
+            ({"path": "shortcut"}, 404),
+        ):
+            assert (
+                api.post("/files/folders", params={**params, **change}, headers=AUTH).status_code
+                == status
+            )
+    assert (folder / "Новая папка").is_dir()
+    assert existing.read_bytes() == b"data"

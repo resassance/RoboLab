@@ -1,5 +1,6 @@
 import asyncio
 import os
+import stat
 import sys
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
@@ -73,6 +74,16 @@ class FileRoots:
                 ),
                 key=lambda name: (name.casefold(), name),
             )
+
+    def create_folder(self, root: Path, path: list[str], name: str, exist_ok: bool) -> None:
+        with directory((*root.parts[1:], *path)) as fd:
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=fd)
+            except FileExistsError:
+                if not exist_ok or not stat.S_ISDIR(
+                    os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode
+                ):
+                    raise
 
 
 class FileUpload:

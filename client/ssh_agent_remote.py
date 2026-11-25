@@ -7,21 +7,20 @@ import socket
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+from shutil import copyfileobj
 from time import monotonic
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 
-DEPENDENCIES = (
-    "fastapi>=0.115,<1",
-    "uvicorn>=0.35,<1",
-    "websockets>=15,<17",
-    "pydantic>=2.10,<3",
-)
 CHECK_DEPENDENCIES = """
+import sys
 from importlib.metadata import version
+
+sys.path[:0] = sys.argv[1:]
 for package, lower, upper in (
     ("fastapi", (0, 115), (1, 0)),
     ("uvicorn", (0, 35), (1, 0)),
@@ -31,8 +30,11 @@ for package, lower, upper in (
     current = tuple(map(int, version(package).split(".")[:2]))
     if not lower <= current < upper:
         raise SystemExit(1)
+import fastapi
 from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
 """
+MAX_DEPENDENCY_ARCHIVE = 8_388_608
+MAX_UNPACKED_DEPENDENCIES = 33_554_432
 
 
 class StartupError(Exception):
@@ -83,35 +85,66 @@ def run_check(command, disconnected, timeout):
         return process.returncode == 0
 
 
-def dependency_path(runtime, disconnected):
-    if run_check([sys.executable, "-I", "-c", CHECK_DEPENDENCIES], disconnected, 10):
-        return None
-    env = runtime / f"python-{sys.version_info.major}.{sys.version_info.minor}"
-    python = env / "bin" / "python"
-    if not python.is_file() and not run_check(
-        [sys.executable, "-I", "-m", "venv", str(env)], disconnected, 30
+def receive_dependencies(destination):
+    architecture = {
+        "aarch64-linux-gnu": "aarch64",
+        "arm-linux-gnueabihf": "armv7l",
+        "x86_64-linux-gnu": "x86_64",
+    }.get(sysconfig.get_config_var("MULTIARCH"))
+    if (
+        architecture is None
+        or sys.implementation.name != "cpython"
+        or sysconfig.get_config_var("Py_GIL_DISABLED")
     ):
-        raise StartupError("venv")
-    if not run_check([str(python), "-I", "-c", CHECK_DEPENDENCIES], disconnected, 10):
-        if not run_check(
-            [
-                str(python),
-                "-I",
-                "-m",
-                "pip",
-                "--isolated",
-                "install",
-                "--no-input",
-                "--disable-pip-version-check",
-                "--only-binary=:all:",
-                *DEPENDENCIES,
-            ],
-            disconnected,
-            175,
-        ):
-            raise StartupError("dependencies")
-    python_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    return env / "lib" / python_version / "site-packages"
+        raise StartupError("dependencies")
+    report(dependencies=f"cp{sys.version_info.major}{sys.version_info.minor}-{architecture}")
+    size = int.from_bytes(sys.stdin.buffer.read(4), "big")
+    if not 1 <= size <= MAX_DEPENDENCY_ARCHIVE:
+        raise StartupError("dependencies")
+    payload = sys.stdin.buffer.read(size)
+    if len(payload) != size:
+        raise StartupError("dependencies")
+
+    try:
+        with ZipFile(BytesIO(payload)) as archive:
+            entries = archive.infolist()
+            if (
+                len(entries) > 4096
+                or sum(entry.file_size for entry in entries) > MAX_UNPACKED_DEPENDENCIES
+            ):
+                raise StartupError("dependencies")
+            for entry in entries:
+                path = PurePosixPath(entry.filename)
+                if (
+                    not path.parts
+                    or path.is_absolute()
+                    or ".." in path.parts
+                    or "\\" in entry.filename
+                    or entry.is_dir()
+                ):
+                    raise StartupError("dependencies")
+                target = destination.joinpath(*path.parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(entry) as source, target.open("xb") as output:
+                    copyfileobj(source, output)
+    except (BadZipFile, OSError) as exc:
+        raise StartupError("dependencies") from exc
+
+
+def dependency_path(runtime, workspace, disconnected):
+    command = [sys.executable, "-I", "-c", CHECK_DEPENDENCIES]
+    if run_check(command, disconnected, 10):
+        return None
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    cached = runtime / f"python-{version}" / "lib" / f"python{version}" / "site-packages"
+    if cached.is_dir() and run_check([*command, str(cached)], disconnected, 10):
+        return cached
+
+    packages = workspace / "site-packages"
+    receive_dependencies(packages)
+    if not run_check([*command, str(packages)], disconnected, 30):
+        raise StartupError("dependencies")
+    return packages
 
 
 def config_path(home, runtime, workspace, script_dir, disconnected):
@@ -216,7 +249,6 @@ def start():
         finally:
             disconnected.set()
 
-    threading.Thread(target=watch_input, daemon=True).start()
     signal.signal(signal.SIGHUP, lambda *_: disconnected.set())
     signal.signal(signal.SIGTERM, lambda *_: disconnected.set())
 
@@ -243,7 +275,8 @@ def start():
             workspace = Path(directory)
             unpack(archive, workspace)
             config = config_path(home, runtime, workspace, header["script_dir"], disconnected)
-            packages = dependency_path(runtime, disconnected)
+            packages = dependency_path(runtime, workspace, disconnected)
+            threading.Thread(target=watch_input, daemon=True).start()
             serve(workspace, home, config, packages, disconnected)
 
 

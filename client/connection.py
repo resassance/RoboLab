@@ -139,7 +139,12 @@ class RobotConnection:
                         if path == "/files"
                         else "Папка назначения недоступна на агенте."
                     ),
-                    409: "В этой папке уже есть файл с таким именем.",
+                    405: "Обновите агент на Pi, чтобы создавать папки.",
+                    409: (
+                        "Здесь уже есть файл или папка с таким именем."
+                        if path == "/files/folders"
+                        else "В этой папке уже есть файл с таким именем."
+                    ),
                     413: "Размер файла превышает лимит агента.",
                     422: "Агент отклонил параметры передачи файла.",
                     507: "На роботе недостаточно места для файла.",
@@ -212,6 +217,15 @@ class RobotConnection:
             raise RobotError(
                 "Агент вернул неизвестный формат списка папок.", retryable=False
             ) from exc
+
+    async def create_folder(
+        self, root: str, path: tuple[str, ...], name: str, *, exist_ok: bool = False
+    ) -> None:
+        await self.request(
+            "POST",
+            "/files/folders",
+            params={"root": root, "path": path, "name": name, "exist_ok": exist_ok},
+        )
 
     async def upload_file(
         self, root: str, path: tuple[str, ...], name: str, source: AsyncIterator[bytes], size: int

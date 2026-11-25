@@ -155,6 +155,28 @@ def create_app(
         except OSError as exc:
             raise HTTPException(404, "Папка назначения недоступна.") from exc
 
+    @app.post("/files/folders", dependencies=auth, status_code=204)
+    async def create_folder(
+        root: str,
+        name: str,
+        path: Annotated[list[str] | None, Query()] = None,
+        exist_ok: bool = False,
+    ) -> None:
+        parts = path or []
+        location = upload_root(root, parts)
+        if not valid_name(name):
+            raise HTTPException(400, "Недопустимое имя папки.")
+        try:
+            await file_io(file_storage.create_folder, location, parts, name, exist_ok)
+        except FileExistsError as exc:
+            raise HTTPException(409, "Файл или папка с таким именем уже существует.") from exc
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
+                raise HTTPException(404, "Папка назначения недоступна.") from exc
+            if exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+                raise HTTPException(507, "На роботе недостаточно места.") from exc
+            raise HTTPException(400, "Не удалось создать папку.") from exc
+
     @app.post("/files/upload", dependencies=auth, status_code=201)
     async def upload(
         request: Request, root: str, name: str, path: Annotated[list[str] | None, Query()] = None
