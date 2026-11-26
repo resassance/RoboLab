@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "robolab"
-version = "0.1.5"
+version = "0.1.6"
 description = "Workbench for launching and monitoring robot algorithms"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,6 +21,7 @@ client = [
     "websockets>=15,<17",
 ]
 desktop = ["flet[desktop]>=1.0.5,<1.2"]
+voice-desktop = ["vosk==0.3.45", "sounddevice>=0.5,<1"]
 web = ["flet[web]>=1.0.5,<1.2"]
 camera = ["opencv-python-headless>=4.10,<5"]
 release = [

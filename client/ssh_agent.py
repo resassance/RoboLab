@@ -25,6 +25,7 @@ AGENT_FILES = {
     "agent/experiments.py",
     "agent/files.py",
     "agent/main.py",
+    "agent/manual_drive.py",
     "agent/motor_off.py",
     "agent/supervisor.py",
     "agent/telemetry.py",

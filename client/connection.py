@@ -21,6 +21,7 @@ from common.protocol import (
     FileReceipt,
     FileStorage,
     Health,
+    ManualDirection,
     RunStarted,
     SafetyState,
     Script,
@@ -74,6 +75,7 @@ class RobotConnection:
         self.camera_available = False
         self.observability_available = False
         self.files_available = False
+        self.manual_available = False
 
     def http_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -96,6 +98,14 @@ class RobotConnection:
             code = exc.response.status_code
             if code in (401, 403):
                 raise RobotError("Агент отклонил токен.", retryable=False) from exc
+            if path == "/manual" or path.startswith("/manual/"):
+                detail = {
+                    404: "Ручное управление недоступно на агенте.",
+                    409: "Робот занят или движение заблокировано.",
+                    422: "Агент отклонил команду движения.",
+                    503: "Агент не подтвердил выполнение команды движения.",
+                }.get(code, f"Ошибка ручного управления HTTP {code}.")
+                raise RobotError(detail, retryable=code >= 500) from exc
             if path == "/camera" or path.startswith("/camera/"):
                 if code == 404 and method == "DELETE":
                     return exc.response
@@ -170,6 +180,7 @@ class RobotConnection:
             self.camera_available = health.camera_available
             self.observability_available = health.observability_available
             self.files_available = health.files_available
+            self.manual_available = health.manual_available
             return CATALOG.validate_json(await self.request("GET", "/scripts"))
         except ValidationError as exc:
             raise RobotError("Агент вернул неизвестный формат данных.", retryable=False) from exc
@@ -303,6 +314,19 @@ class RobotConnection:
         if requires_heartbeat and started.status == "running" and started.lease is None:
             raise RobotError("Агент не выдал подтверждение удержания запуска.", retryable=False)
         return started
+
+    async def start_manual(self, direction: ManualDirection) -> RunStarted:
+        data = await self.request("POST", "/manual", json={"direction": direction})
+        try:
+            started = RunStarted.model_validate_json(data)
+        except ValidationError as exc:
+            raise RobotError("Агент вернул неизвестный формат запуска.", retryable=False) from exc
+        if started.lease is None:
+            raise RobotError("Агент не подтвердил управление движением.", retryable=False)
+        return started
+
+    async def stop_manual(self, run_id: UUID, lease: UUID) -> None:
+        await self.request("POST", f"/manual/{run_id}/stop", json={"lease": str(lease)})
 
     async def heartbeat(self, run_id: UUID, lease: UUID) -> None:
         await self.request("POST", f"/runs/{run_id}/heartbeat", json={"lease": str(lease)})

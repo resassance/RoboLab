@@ -34,6 +34,7 @@ def test_registry_lists_only_original_example_and_rejects_other_commands(api):
         "protocol": 1,
         "robot": "mock",
         "observability_available": True,
+        "manual_available": True,
     }
     catalog = api.get("/scripts").json()
     assert [script["id"] for script in catalog] == ["mock-robot"]

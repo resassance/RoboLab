@@ -1,0 +1,18 @@
+name: robolab_voice_android
+description: Offline Vosk microphone recognition for RoboLab
+version: 0.1.0
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+
+dependencies:
+  flet: 1.1.2
+  flutter:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: io.github.resassance.robolab_voice_android
+        pluginClass: VoicePlugin

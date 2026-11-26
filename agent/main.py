@@ -42,6 +42,7 @@ from agent.supervisor import RunConflict, Supervisor
 from agent.telemetry import TelemetrySampler
 from agent.yahboom import DeviceBusy, Yahboom, load_yahboom
 from common.protocol import (
+    MANUAL_SCRIPT_ID,
     PROTOCOL_VERSION,
     CameraOptions,
     CameraStarted,
@@ -51,6 +52,7 @@ from common.protocol import (
     FileStorage,
     Health,
     Heartbeat,
+    ManualRequest,
     RunStarted,
     RunState,
     SafetyState,
@@ -63,6 +65,8 @@ from common.protocol import (
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 MOCK = Script.model_validate_json((EXAMPLES / "mock_robot.json").read_bytes())
 REGISTRY = {MOCK.id: (MOCK, EXAMPLES / "mock_robot.py")}
+MANUAL_WORKER = Path(__file__).with_name("manual_drive.py")
+MANUAL_LIMIT = 5.0
 MAX_TOKEN_FILE_BYTES = 256 + len(b"\r\n")
 POWEROFF_HOLD_SECONDS = 30
 logger = logging.getLogger(__name__)
@@ -85,6 +89,7 @@ def create_app(
     sampler = TelemetrySampler()
     supervisor = Supervisor(hardware, history)
     poweroff_hold_until: float | None = None
+    manual_available = hardware is None or hardware.settings.allow_motion
     source = None
     if hardware is not None and hardware.settings.camera_device is not None:
         source = CameraSource(
@@ -128,6 +133,7 @@ def create_app(
             camera_available=source is not None,
             observability_available=True,
             files_available=bool(file_storage.roots),
+            manual_available=manual_available,
         )
 
     def upload_root(root: str, path: list[str]) -> Path:
@@ -273,6 +279,46 @@ def create_app(
         except OSError as exc:
             logger.exception("Could not launch registered script %s", script_id)
             raise HTTPException(503, "Агент не смог подготовить или создать процесс.") from exc
+
+    @app.post("/manual", dependencies=auth, status_code=201)
+    async def start_manual(request: ManualRequest) -> RunStarted:
+        if not manual_available:
+            raise HTTPException(404, "Ручное движение отключено в конфигурации агента.")
+        arguments = ["--direction", request.direction, "--wait-for-arm"]
+        if hardware is not None:
+            arguments.extend(
+                [
+                    "--script-dir",
+                    str(hardware.settings.script_dir),
+                    "--config",
+                    str(hardware.settings.config_file),
+                ]
+            )
+        try:
+            return await supervisor.start(
+                MANUAL_SCRIPT_ID,
+                MANUAL_WORKER,
+                arguments,
+                hardware_seconds=MANUAL_LIMIT if hardware is not None else None,
+                manual_seconds=MANUAL_LIMIT,
+                script_name="Ручное управление",
+            )
+        except RunConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except DeviceBusy as exc:
+            raise HTTPException(409, "Оборудование занято другим процессом.") from exc
+        except OSError as exc:
+            logger.exception("Could not launch manual drive")
+            raise HTTPException(503, "Агент не смог запустить ручное движение.") from exc
+
+    @app.post("/manual/{run_id}/stop", dependencies=auth, status_code=204)
+    async def stop_manual(run_id: UUID, request: Heartbeat) -> None:
+        try:
+            await supervisor.stop_manual(run_id, request.lease)
+        except RunConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(503, "Агент не подтвердил остановку.") from exc
 
     @app.post("/runs/{run_id}/heartbeat", dependencies=auth, status_code=204)
     async def heartbeat(run_id: UUID, request: Heartbeat) -> None:

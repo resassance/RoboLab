@@ -31,10 +31,11 @@ from client.configuration import ConfigurationStore, ParameterDialog
 from client.connection import RobotConnection, RobotError
 from client.experiments import RUN_STATUS, ExperimentsPanel, TelemetryPanel
 from client.files import FilePanel
+from client.manual import ManualPanel
 from client.run_journal import RunJournal
 from client.ssh import PoweroffUnconfirmed, SshError, SshSession, SshTarget
 from client.ssh_login import SshLogin, confirm, safe_poweroff
-from common.protocol import EventFrame, RunState, SafetyState, Script
+from common.protocol import MANUAL_SCRIPT_ID, EventFrame, RunState, SafetyState, Script
 
 HEARTBEAT_PERIOD = 0.7
 LEASE_TIMEOUT = 4
@@ -174,6 +175,7 @@ class Dashboard:
         )
         self.error = ft.Text(color=ERROR, visible=False)
         self.journal = RunJournal()
+        self.manual = ManualPanel(page, self.manual_robot, self.refresh)
 
     def mount(self) -> None:
         self.page.title = "RoboLab"
@@ -185,6 +187,7 @@ class Dashboard:
         self.page.on_disconnect = self.disconnect_page
         self.page.on_close = self.close
         self.page.on_resize = self.resize
+        self.page.on_app_lifecycle_state_change = self.manual_lifecycle
         self.page.services.append(self.camera_picker)
 
         self.desktop_status = ft.Text(size=15, color=MUTED)
@@ -277,6 +280,7 @@ class Dashboard:
                 self.description,
                 button_row(self.parameters_button, self.start_button, self.stop_button),
                 self.run_status_box,
+                self.manual.content,
             ],
             spacing=8,
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
@@ -601,6 +605,7 @@ class Dashboard:
 
     async def disconnect(self) -> None:
         self.disconnecting = True
+        await self.manual.deactivate()
         task, self.task = self.task, None
         ssh_task, self.ssh_task = self.ssh_task, None
         agent_task, self.agent_task = self.agent_task, None
@@ -671,6 +676,7 @@ class Dashboard:
                             self.refresh()
                 except RobotError as exc:
                     self.connected = False
+                    await self.manual.deactivate()
                     self.close_observability()
                     if self.ssh_session is None:
                         self.close_files()
@@ -697,6 +703,7 @@ class Dashboard:
                     delay = min(delay * 2, 8)
         finally:
             if robot is self.robot:
+                await self.manual.deactivate()
                 self.drop_lease()
                 self.robot = None
                 self.connected = False
@@ -722,6 +729,7 @@ class Dashboard:
         previous_safety = self.safety
         self.current = packet.run
         self.safety = packet.safety
+        self.manual.observe(packet.run)
         run_id = packet.run.id if packet.run else None
         if self.leased_run is not None and (
             (packet.safety is not None and packet.safety.latched)
@@ -838,6 +846,7 @@ class Dashboard:
         self.stop_button.disabled = (
             not self.connected or self.pending or current is None or current.status != "running"
         )
+        self.manual.update(bool(self.robot and getattr(self.robot, "manual_available", False)))
         self.safety_controls.visible = hardware
         self.emergency_button.visible = hardware
         self.emergency_strip.visible = hardware
@@ -922,7 +931,8 @@ class Dashboard:
     def format_run(self, current: RunState | None) -> str:
         if current is None:
             return "Запусков пока нет."
-        fields = [RUN_STATUS[current.status], f"{current.elapsed_seconds:.1f} с"]
+        fields = ["Ручное управление"] if current.script_id == MANUAL_SCRIPT_ID else []
+        fields.extend([RUN_STATUS[current.status], f"{current.elapsed_seconds:.1f} с"])
         if current.pid is not None:
             fields.append(f"PID {current.pid}")
         if current.exit_code is not None:
@@ -970,6 +980,8 @@ class Dashboard:
             return
         if self.start_button.disabled:
             return
+        if self.manual.voice_requested:
+            await self.manual.deactivate()
         generation = self.lease_generation
 
         async def launch() -> None:
@@ -1056,6 +1068,9 @@ class Dashboard:
     async def stop(self, event: ft.ControlEvent) -> None:
         robot, current = self.robot, self.current
         if robot and current and not self.stop_button.disabled:
+            if self.manual.owned is not None and self.manual.owned[1].id == current.id:
+                await self.manual.command("stop")
+                return
             if current.id == self.leased_run:
                 self.drop_lease()
             await self.command(lambda: robot.stop(current.id))
@@ -1064,7 +1079,10 @@ class Dashboard:
         robot = self.robot
         if robot is not None and not self.emergency_button.disabled:
             self.drop_lease()
-            await self.safety_command(robot, robot.safety_stop)
+            self.manual.cancel_heartbeat()
+            await asyncio.gather(
+                self.safety_command(robot, robot.safety_stop), self.manual.deactivate()
+            )
 
     async def request_poweroff(self, event: ft.ControlEvent) -> None:
         robot, session, target = self.robot, self.ssh_session, self.ssh_target
@@ -1174,6 +1192,7 @@ class Dashboard:
 
     async def disconnect_page(self, event: ft.ControlEvent) -> None:
         self.page_available = False
+        await self.manual.deactivate()
         if self.ssh_session is not None or self.ssh_task is not None:
             await self.disconnect()
             return
@@ -1189,6 +1208,42 @@ class Dashboard:
     async def close(self, event: ft.ControlEvent) -> None:
         self.closed = True
         await self.disconnect()
+
+    def manual_robot(self) -> RobotConnection | None:
+        robot = self.robot
+        current = self.current
+        if (
+            self.closed
+            or not self.page_available
+            or not self.connected
+            or self.disconnecting
+            or self.files_open
+            or self.observability is not None
+            or self.pending
+            or self.poweroff_dialog
+            or self.poweroff_pending
+            or robot is None
+            or not getattr(robot, "manual_available", False)
+            or (
+                robot.kind == "yahboom"
+                and (self.safety is None or self.safety.latched or self.safety_pending is robot)
+            )
+            or (
+                current is not None
+                and current.script_id != MANUAL_SCRIPT_ID
+                and current.status in ("running", "stopping")
+            )
+        ):
+            return None
+        return robot
+
+    async def manual_lifecycle(self, event: ft.AppLifecycleStateChangeEvent) -> None:
+        if event.state in (
+            ft.AppLifecycleState.HIDE,
+            ft.AppLifecycleState.PAUSE,
+            ft.AppLifecycleState.DETACH,
+        ):
+            await self.manual.deactivate()
 
     def refresh_camera(self, hardware_run_active: bool) -> None:
         robot = self.robot
@@ -1231,11 +1286,13 @@ class Dashboard:
     async def open_telemetry(self, event: ft.ControlEvent) -> None:
         robot = self.observability_robot()
         if robot is not None and not self.telemetry_button.disabled:
+            await self.manual.deactivate()
             self.show_observability("Телеметрия", TelemetryPanel(robot))
 
     async def open_experiments(self, event: ft.ControlEvent) -> None:
         robot = self.observability_robot()
         if robot is not None and not self.experiments_button.disabled:
+            await self.manual.deactivate()
             self.show_observability(
                 "Эксперименты", ExperimentsPanel(self.page, robot, self.camera_picker)
             )
@@ -1292,6 +1349,7 @@ class Dashboard:
             files = robot
         else:
             return
+        await self.manual.deactivate()
         self.close_observability()
         self.files_open = True
         if self.files is None:

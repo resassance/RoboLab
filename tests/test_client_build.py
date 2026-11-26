@@ -85,3 +85,29 @@ def test_release_staging_includes_only_tracked_sources(tmp_path, platform, pytho
         )
     )
     assert project["tool"]["flet"]["android"]["permission"] == {"android.permission.INTERNET": True}
+
+
+def test_android_voice_stages_plugin_and_offline_model(tmp_path, monkeypatch):
+    from hashlib import sha256
+
+    from scripts import build_client
+
+    archive = tmp_path / "model.zip"
+    with ZipFile(archive, "w") as bundle:
+        bundle.writestr(f"{build_client.VOICE_MODEL}/am/final.mdl", b"model")
+    monkeypatch.setattr(
+        build_client, "VOICE_MODEL_SHA256", sha256(archive.read_bytes()).hexdigest()
+    )
+    wheel = tmp_path / "robolab_voice_android-0.1.0-py3-none-any.whl"
+    wheel.touch()
+    destination = tmp_path / "app"
+    stage_client(ROOT, destination, platform="apk", voice_wheel=wheel, voice_archive=archive)
+    config = tomllib.loads((destination / "pyproject.toml").read_text())
+    assert f"robolab-voice-android @ {wheel.as_uri()}" in config["project"]["dependencies"]
+    assert config["tool"]["flet"]["android"]["permission"]["android.permission.RECORD_AUDIO"]
+    assert (destination / "client" / "voice_model" / "am" / "final.mdl").read_bytes() == b"model"
+    assert (destination / "client" / "voice_model" / "LICENSE").is_file()
+
+    archive.write_bytes(b"invalid")
+    with pytest.raises(ValueError, match="SHA-256"):
+        build_client.stage_voice_model(ROOT, tmp_path, archive)

@@ -17,6 +17,8 @@ from agent.yahboom import Yahboom
 from common.parameters import Value
 from common.protocol import (
     LOG_LIMIT,
+    MANUAL_HEARTBEAT_TIMEOUT,
+    MANUAL_SCRIPT_ID,
     EventFrame,
     Experiment,
     ExperimentDetails,
@@ -48,6 +50,8 @@ class Lease:
     token: UUID
     expires: float
     deadline: float
+    interval: float
+    armed: bool = False
 
 
 @dataclass
@@ -111,6 +115,7 @@ class Supervisor:
         arguments: list[str],
         hardware_seconds: float | None = None,
         *,
+        manual_seconds: float | None = None,
         script_name: str | None = None,
         parameters: dict[str, Value] | None = None,
     ) -> RunStarted:
@@ -146,7 +151,11 @@ class Supervisor:
                     *arguments,
                     cwd=path.parent,
                     env=environment,
-                    stdin=asyncio.subprocess.DEVNULL,
+                    stdin=(
+                        asyncio.subprocess.PIPE
+                        if manual_seconds is not None
+                        else asyncio.subprocess.DEVNULL
+                    ),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     **device_options,
@@ -168,10 +177,15 @@ class Supervisor:
 
             run.process = process
             self.current = run
-            if hardware_seconds is not None and run.device_fd is not None:
+            lease_seconds = manual_seconds if manual_seconds is not None else hardware_seconds
+            if lease_seconds is not None:
                 now = monotonic()
-                run.lease = Lease(uuid4(), now + HEARTBEAT_TIMEOUT, now + hardware_seconds)
-                self.update_cutoff(None)
+                interval = (
+                    MANUAL_HEARTBEAT_TIMEOUT if manual_seconds is not None else HEARTBEAT_TIMEOUT
+                )
+                run.lease = Lease(uuid4(), now + interval, now + lease_seconds, interval)
+                if run.device_fd is not None:
+                    self.update_cutoff(None)
                 run.watchdog = asyncio.create_task(self.watch_lease(run))
             self.record_run(run)
             run.task = asyncio.create_task(self.collect(run, process))
@@ -258,10 +272,17 @@ class Supervisor:
             or run.status != "running"
             or run.lease is None
             or run.lease.token != token
+            or run.process is None
+            or run.process.returncode is not None
             or now >= min(run.lease.expires, run.lease.deadline)
         ):
             raise RunConflict("Подтверждение управления больше не действует.")
-        run.lease.expires = now + HEARTBEAT_TIMEOUT
+        pipe = run.process.stdin
+        if pipe is not None and not run.lease.armed:
+            pipe.write(b"1")
+            pipe.close()
+            run.lease.armed = True
+        run.lease.expires = now + run.lease.interval
 
     async def watch_lease(self, run: Run) -> None:
         assert run.lease is not None and run.process is not None
@@ -276,7 +297,8 @@ class Supervisor:
                 continue
             if run.status == "running" and lease.expires <= lease.deadline:
                 reason = "Потеряна связь с управляющим клиентом."
-                self.inhibit(reason)
+                if run.device_fd is not None:
+                    self.inhibit(reason)
                 self.append_log(run, "agent", "WARNING", reason)
             else:
                 self.append_log(run, "agent", "INFO", "Истёк лимит времени запуска.")
@@ -328,7 +350,7 @@ class Supervisor:
             self.append_log(run, source, level, message, event)
 
     def record_run(self, run: Run) -> None:
-        if self.history is None:
+        if self.history is None or run.script_id == MANUAL_SCRIPT_ID:
             return
         state = run.state()
         self.history.record(
@@ -381,6 +403,8 @@ class Supervisor:
             safe = True
         else:
             safe = await self.finish_hardware(run, process, stdout, stderr)
+        if run.watchdog is not None:
+            run.watchdog.cancel()
 
         run.finished = monotonic()
         run.finished_at = datetime.now(UTC)
@@ -421,8 +445,6 @@ class Supervisor:
                 self.inhibit(reason)
                 self.append_log(run, "agent", "ERROR", reason)
         finally:
-            if run.watchdog is not None:
-                run.watchdog.cancel()
             if not readers.done():
                 readers.cancel()
             try:
@@ -449,15 +471,35 @@ class Supervisor:
             raise KeyError(run_id)
         process = run.process
         if process is not None and process.returncode is None:
-            if force and run.device_fd is not None:
+            if process.stdin is not None:
+                process.stdin.close()
+            if force:
                 run.status = "stopping"
-                self.kill_group(process)
+                if run.device_fd is not None:
+                    self.kill_group(process)
+                else:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
                 self.notify()
             elif run.status == "running":
                 run.status = "stopping"
                 self.notify()
                 asyncio.create_task(self.terminate(run, process))
         return run.state()
+
+    async def stop_manual(self, run_id: UUID, token: UUID) -> None:
+        run = self.current
+        if run is None or run.id != run_id:
+            return
+        if run.script_id != MANUAL_SCRIPT_ID or run.lease is None or run.lease.token != token:
+            raise RunConflict("Команда остановки не относится к этому запуску.")
+        self.stop(run_id)
+        if run.task is not None:
+            await asyncio.wait_for(asyncio.shield(run.task), timeout=EMERGENCY_TIMEOUT)
+        if self.safety is not None and self.safety.motor_disable_confirmed is False:
+            raise OSError("Motor enable cutoff not confirmed")
 
     @staticmethod
     async def wait_for_exit(process: asyncio.subprocess.Process) -> None:
@@ -476,7 +518,8 @@ class Supervisor:
         try:
             process.terminate()
             wait = self.wait_for_exit(process) if uses_hardware else process.wait()
-            await asyncio.wait_for(wait, timeout=STOP_TIMEOUT)
+            timeout = 0.25 if run.script_id == MANUAL_SCRIPT_ID else STOP_TIMEOUT
+            await asyncio.wait_for(wait, timeout=timeout)
         except ProcessLookupError:
             return
         except TimeoutError:

@@ -62,9 +62,13 @@ def receive_until(events, condition):
     pytest.fail("Expected state did not arrive")
 
 
-def test_hardware_is_opt_in_and_uses_a_private_lease(api, hardware):
-    adapter, calls = hardware
-    assert api.get("/health").json()["robot"] == "yahboom"
+def test_hardware_is_opt_in_and_uses_a_private_lease(api, hardware, monkeypatch):
+    _, calls = hardware
+    monkeypatch.setattr(supervisor, "HEARTBEAT_TIMEOUT", 4.0)
+    health = api.get("/health").json()
+    assert health["robot"] == "yahboom"
+    assert health.get("manual_available", False) is False
+    assert api.post("/manual", json={"direction": "forward"}).status_code == 404
     scripts = {script["id"]: script for script in api.get("/scripts").json()}
     assert scripts["yahboom-distance"]["requires_heartbeat"] is True
     assert "yahboom-auto" not in scripts

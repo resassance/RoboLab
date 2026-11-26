@@ -9,6 +9,9 @@ from common.parameters import Parameter, Value
 
 PROTOCOL_VERSION = 1
 LOG_LIMIT = 300
+MANUAL_SCRIPT_ID = "manual-drive"
+MANUAL_HEARTBEAT_TIMEOUT = 1.0
+ManualDirection = Literal["forward", "backward", "left", "right"]
 
 RunStatus = Literal["running", "stopping", "succeeded", "stopped", "failed"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -25,6 +28,7 @@ class Health(BaseModel):
     camera_available: bool = False
     observability_available: bool = False
     files_available: bool = False
+    manual_available: bool = False
 
 
 class FileStorage(BaseModel):
@@ -96,6 +100,12 @@ class StartRequest(BaseModel):
     script_id: str
     parameters: dict[str, Value] = Field(default_factory=dict, max_length=64)
     supports_lease: bool = False
+
+
+class ManualRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    direction: ManualDirection
 
 
 class RunState(BaseModel):
